@@ -116,7 +116,7 @@ def make_text_overlay(
 
     while font_size >= min_font:
         quote_font = load_font(quote_font_file, int(font_size))
-        author_font = load_font(author_font_file or quote_font_file, max(int(font_size * 0.38), 22))
+        author_font = load_font(author_font_file or quote_font_file, max(int(font_size * 0.58), 32))
         lines = balance_wrap(quote, width=max(11, int(19 * (width / 1080))))
         max_w = 0
         total_h = 0
@@ -134,10 +134,10 @@ def make_text_overlay(
         font_size -= 6
 
     quote_font = load_font(quote_font_file, int(font_size))
-    author_font = load_font(author_font_file or quote_font_file, max(int(font_size * 0.38), 22))
+    author_font = load_font(author_font_file or quote_font_file, max(int(font_size * 0.58), 32))
     lines = balance_wrap(quote, width=max(11, int(19 * (width / 1080))))
     line_gap = int(font_size * 0.11)
-    author_gap = int(font_size * 0.58)
+    author_gap = int(font_size * 0.5)
     shadow_offset = (max(2, int(font_size * 0.018)), max(3, int(font_size * 0.028)))
     quote_metrics = [text_size(draw, line, quote_font, stroke_width=1) for line in lines]
     quote_height = sum(height_value for _, height_value in quote_metrics) + line_gap * max(len(lines) - 1, 0)
