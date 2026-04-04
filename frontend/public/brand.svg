@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-label="Video Forge">
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#64d2c7" />
+      <stop offset="100%" stop-color="#f3b562" />
+    </linearGradient>
+  </defs>
+  <rect width="128" height="128" rx="28" fill="#081c27" />
+  <path d="M28 26h48c14.36 0 26 11.64 26 26v24c0 14.36-11.64 26-26 26H28z" fill="url(#bg)" />
+  <path d="M58 46l24 18-24 18z" fill="#081c27" />
+  <rect x="18" y="36" width="18" height="56" rx="9" fill="#eff5f7" fill-opacity=".9" />
+</svg>

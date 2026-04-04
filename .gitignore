@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+*.pyc
+.codex
+state/
+frontend/node_modules/
+frontend/dist/
+.playwright-cli/
+backend/*.egg-info/
+backend/**/*.egg-info/
+outputs/
+*.log
+*TEMP_MPY*

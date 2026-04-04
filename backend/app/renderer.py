@@ -1,0 +1,235 @@
+from __future__ import annotations
+
+import logging
+import math
+import time
+from pathlib import Path
+from typing import Callable
+import textwrap
+
+import numpy as np
+from PIL import Image, ImageDraw, ImageEnhance, ImageFont, ImageOps
+from moviepy.audio.fx.all import audio_fadein
+from moviepy.editor import AudioFileClip, CompositeVideoClip, ImageClip, vfx
+
+from .config import AppConfig
+
+logger = logging.getLogger(__name__)
+
+if not hasattr(Image, "ANTIALIAS"):
+    Image.ANTIALIAS = Image.Resampling.LANCZOS
+
+
+def load_font(font_file: str | None, size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
+    try:
+        return ImageFont.truetype(font_file, size) if font_file else ImageFont.load_default()
+    except Exception:
+        return ImageFont.load_default()
+
+
+def balance_wrap(text: str, width: int) -> list[str]:
+    words = text.split()
+    if not words:
+        return [""]
+    best_lines: list[str] | None = None
+    best_score: float | None = None
+    for candidate_width in range(max(12, width - 6), width + 7):
+        lines = textwrap.wrap(text, width=candidate_width, break_long_words=False, break_on_hyphens=False)
+        if not lines:
+            continue
+        lengths = [len(line.strip()) for line in lines]
+        if len(lengths) == 1:
+            score = lengths[0]
+        else:
+            mean = sum(lengths) / len(lengths)
+            variance = sum((length - mean) ** 2 for length in lengths) / len(lengths)
+            shortest_penalty = max(0, int(mean * 0.55) - min(lengths)) * 10
+            last_line_penalty = max(0, int(mean * 0.65) - lengths[-1]) * 12
+            score = variance + shortest_penalty + last_line_penalty + (len(lines) * 2)
+        if best_score is None or score < best_score:
+            best_score = score
+            best_lines = lines
+    return best_lines or [text]
+
+
+def text_size(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.ImageFont, stroke_width: int = 0) -> tuple[int, int]:
+    bbox = draw.textbbox((0, 0), text, font=font, stroke_width=stroke_width)
+    return bbox[2] - bbox[0], bbox[3] - bbox[1]
+
+
+def draw_text_with_shadow(
+    draw: ImageDraw.ImageDraw,
+    position: tuple[int, int],
+    text: str,
+    *,
+    font: ImageFont.ImageFont,
+    fill: tuple[int, int, int, int],
+    shadow_fill: tuple[int, int, int, int],
+    shadow_offset: tuple[int, int],
+    stroke_width: int = 0,
+    stroke_fill: tuple[int, int, int, int] | None = None,
+) -> None:
+    x, y = position
+    offset_x, offset_y = shadow_offset
+    draw.text(
+        (x + offset_x, y + offset_y),
+        text,
+        font=font,
+        fill=shadow_fill,
+        stroke_width=stroke_width,
+        stroke_fill=stroke_fill,
+    )
+    draw.text(
+        (x, y),
+        text,
+        font=font,
+        fill=fill,
+        stroke_width=stroke_width,
+        stroke_fill=stroke_fill,
+    )
+
+
+def fit_image_to_frame(image_path: Path, width: int, height: int, darken: float) -> Image.Image:
+    with Image.open(image_path).convert("RGB") as image:
+        fitted = ImageOps.fit(image, (width, height), method=Image.LANCZOS)
+    if darken < 0.999:
+        fitted = ImageEnhance.Brightness(fitted).enhance(darken)
+    return fitted
+
+
+def make_text_overlay(quote: str, width: int, height: int, author: str | None = None, font_file: str | None = None) -> Image.Image:
+    canvas = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(canvas)
+    max_font = int(width * 0.074)
+    min_font = int(width * 0.028)
+    font_size = max_font
+    quote_max_width = width * 0.72
+    quote_max_height = height * 0.34
+    author_text = f"— {author.strip()}" if author and author.strip() else ""
+
+    while font_size >= min_font:
+        quote_font = load_font(font_file, int(font_size))
+        author_font = load_font(font_file, max(int(font_size * 0.42), 22))
+        lines = balance_wrap(quote, width=max(12, int(20 * (width / 1080))))
+        max_w = 0
+        total_h = 0
+        for line in lines:
+            line_w, line_h = text_size(draw, line, quote_font, stroke_width=1)
+            max_w = max(max_w, line_w)
+            total_h += line_h
+        total_h += int((len(lines) - 1) * font_size * 0.16)
+        if author_text:
+            author_w, author_h = text_size(draw, author_text, author_font, stroke_width=0)
+            max_w = max(max_w, author_w)
+            total_h += int(font_size * 0.48) + author_h
+        if max_w <= quote_max_width and total_h <= quote_max_height:
+            break
+        font_size -= 6
+
+    quote_font = load_font(font_file, int(font_size))
+    author_font = load_font(font_file, max(int(font_size * 0.42), 22))
+    lines = balance_wrap(quote, width=max(12, int(20 * (width / 1080))))
+    line_gap = int(font_size * 0.14)
+    author_gap = int(font_size * 0.56)
+    shadow_offset = (max(2, int(font_size * 0.018)), max(3, int(font_size * 0.028)))
+    quote_metrics = [text_size(draw, line, quote_font, stroke_width=1) for line in lines]
+    quote_height = sum(height_value for _, height_value in quote_metrics) + line_gap * max(len(lines) - 1, 0)
+    author_size = text_size(draw, author_text, author_font, stroke_width=0) if author_text else (0, 0)
+    total_h = quote_height + (author_gap + author_size[1] if author_text else 0)
+    y = (height - total_h) // 2
+    for line, (line_w, line_h) in zip(lines, quote_metrics, strict=False):
+        x = (width - line_w) // 2
+        draw_text_with_shadow(
+            draw,
+            (x, y),
+            line,
+            font=quote_font,
+            fill=(248, 244, 238, 255),
+            shadow_fill=(6, 8, 11, 120),
+            shadow_offset=shadow_offset,
+            stroke_width=1,
+            stroke_fill=(15, 18, 22, 140),
+        )
+        y += line_h + line_gap
+
+    if author_text:
+        y += author_gap
+        author_w, _ = author_size
+        x = (width - author_w) // 2
+        draw_text_with_shadow(
+            draw,
+            (x, y),
+            author_text,
+            font=author_font,
+            fill=(232, 226, 214, 230),
+            shadow_fill=(6, 8, 11, 96),
+            shadow_offset=(shadow_offset[0], shadow_offset[1] + 1),
+        )
+    return canvas
+
+
+def render_video(
+    config: AppConfig,
+    image_path: Path,
+    music_path: Path,
+    quote: str,
+    author: str | None,
+    outname: str,
+    darken: float,
+    font_file: str | None,
+    progress_callback: Callable[[str, float, str], None],
+) -> Path:
+    bg_pil = fit_image_to_frame(image_path, config.width, config.height, darken)
+    overlay_pil = make_text_overlay(quote, config.width, config.height, author=author, font_file=font_file)
+    bg_np = np.array(bg_pil)
+    overlay_np = np.array(overlay_pil)
+
+    progress_callback("rendering", 0.35, "Preparing audio and timeline")
+    audio = AudioFileClip(str(music_path))
+    bg_clip = txt_clip = final = audio_fx = None
+    try:
+        audio_dur = float(audio.duration)
+        duration = min(audio_dur, config.max_duration)
+        fade_in = max(0.1, audio_dur / 7.0)
+
+        progress_callback("rendering", 0.52, "Building animation layers")
+        bg_clip = ImageClip(bg_np).set_duration(duration).set_fps(config.fps)
+        zoom_amount = 1.04
+
+        def zoom(t: float) -> float:
+            return 1 + (zoom_amount - 1) * (0.5 - 0.5 * math.cos(math.pi * (t / max(duration, 0.0001))))
+
+        bg_clip = bg_clip.fx(vfx.resize, lambda t: zoom(t)).fx(vfx.fadein, fade_in)
+        txt_clip = ImageClip(overlay_np, ismask=False).set_duration(duration).set_position(("center", "center"))
+        if config.text_fade > 0:
+            txt_clip = txt_clip.fx(vfx.fadein, config.text_fade)
+        final = CompositeVideoClip([bg_clip, txt_clip], size=(config.width, config.height)).set_duration(duration)
+        audio_fx = audio.subclip(0, duration)
+        audio_fx = audio_fadein(audio_fx, fade_in)
+        final = final.set_audio(audio_fx)
+
+        config.outputs_dir.mkdir(parents=True, exist_ok=True)
+        outpath = config.outputs_dir / outname
+        progress_callback("rendering", 0.66, "Encoding video with FFmpeg")
+        final.write_videofile(
+            str(outpath),
+            fps=config.fps,
+            codec="libx264",
+            audio_codec="aac",
+            preset=config.encoder_preset,
+            threads=config.encoder_threads,
+            logger=None,
+            ffmpeg_params=["-crf", config.crf],
+        )
+        progress_callback("finalizing", 0.96, "Finalizing output")
+        return outpath
+    finally:
+        for clip in (final, bg_clip, txt_clip, audio_fx, audio):
+            if clip is None:
+                continue
+            try:
+                clip.close()
+            except Exception:
+                logger.exception("Failed to close clip")
+        bg_pil.close()
+        overlay_pil.close()
