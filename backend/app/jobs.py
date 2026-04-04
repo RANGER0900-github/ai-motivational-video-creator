@@ -131,7 +131,8 @@ class JobService:
         self._progress(job_id, "preparing", 0.08, "Preparing", "Loading project assets", started=True)
         image_path = self.context.assets.choose_image(job.image_name)
         music_path = self.context.assets.choose_music(job.music_name)
-        font_file = self.context.assets.default_font()
+        quote_font_file = self.context.assets.default_quote_font()
+        author_font_file = self.context.assets.default_author_font()
         self._progress(job_id, "preparing", 0.2, "Preparing", f"Using {image_path.name} with {music_path.name}")
 
         outname = f"job_{job_id}_{int(time.time())}.mp4"
@@ -150,7 +151,8 @@ class JobService:
                 author=job.author,
                 outname=outname,
                 darken=job.darken,
-                font_file=font_file,
+                quote_font_file=quote_font_file,
+                author_font_file=author_font_file,
                 progress_callback=emit,
             )
             relative_output = outpath.relative_to(self.context.config.root_dir).as_posix()

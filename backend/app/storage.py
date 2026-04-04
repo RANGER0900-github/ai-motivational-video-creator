@@ -80,8 +80,30 @@ class AssetStore:
             return music[requested_name]
         return random.choice(list(music.values()))
 
-    def default_font(self) -> str | None:
+    def _preferred_system_font(self, candidates: list[str]) -> str | None:
+        for candidate in candidates:
+            path = Path(candidate)
+            if path.exists():
+                return str(path)
+        return None
+
+    def default_quote_font(self) -> str | None:
+        preferred = self._preferred_system_font([
+            "/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+        ])
+        if preferred:
+            return preferred
         fonts = self.list_fonts()
         if not fonts:
             return None
         return str(self.config.root_dir / fonts[0].path)
+
+    def default_author_font(self) -> str | None:
+        preferred = self._preferred_system_font([
+            "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+        ])
+        if preferred:
+            return preferred
+        return self.default_quote_font()

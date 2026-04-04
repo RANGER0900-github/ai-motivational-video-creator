@@ -611,6 +611,9 @@ button {
   display: grid;
   place-items: center;
   padding: 24px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  -webkit-overflow-scrolling: touch;
 }
 
 .lightbox-backdrop {
@@ -625,12 +628,15 @@ button {
   position: relative;
   width: min(100%, 1080px);
   padding: 24px;
+  max-height: calc(100vh - 48px);
+  overflow-y: auto;
   border-radius: 32px;
   border: 1px solid rgba(255, 255, 255, 0.1);
   background:
     linear-gradient(180deg, rgba(255, 255, 255, 0.05), transparent 18%),
     linear-gradient(180deg, rgba(9, 24, 35, 0.96), rgba(7, 20, 29, 0.94));
   box-shadow: 0 34px 100px rgba(0, 0, 0, 0.45);
+  overscroll-behavior: contain;
 }
 
 .lightbox-close {
@@ -755,6 +761,16 @@ button {
   .lightbox-panel {
     padding: 22px 18px;
     border-radius: 28px;
+  }
+
+  .lightbox {
+    place-items: start center;
+    padding: 12px;
+  }
+
+  .lightbox-panel {
+    width: min(100%, 1000px);
+    max-height: calc(100vh - 24px);
   }
 
   .status-strip {

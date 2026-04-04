@@ -144,6 +144,18 @@ export default function App() {
     return nextOverview;
   }
 
+  async function refreshActiveJobFallback() {
+    const jobs = await fetchJson("/api/jobs");
+    const nextActiveJob = jobs.find((candidate) => ACTIVE_STATUSES.has(candidate.status));
+    if (!nextActiveJob) {
+      return null;
+    }
+    startTransition(() => {
+      setJob(nextActiveJob);
+    });
+    return nextActiveJob;
+  }
+
   async function refreshVideos() {
     const nextVideos = await fetchJson("/api/library/videos");
     startTransition(() => {
@@ -166,6 +178,10 @@ export default function App() {
         refreshJob(storedJobId).catch(() => {
           writeStoredJobId(null);
         }),
+      );
+    } else {
+      tasks.push(
+        refreshActiveJobFallback().catch(() => null),
       );
     }
 
@@ -212,11 +228,14 @@ export default function App() {
       if (view === "gallery" && galleryLoaded) {
         refreshVideos().catch(() => {});
       }
+      if (!job || !ACTIVE_STATUSES.has(job.status)) {
+        refreshActiveJobFallback().catch(() => null);
+      }
     }, 15000);
     return () => {
       window.clearInterval(intervalId);
     };
-  }, [galleryLoaded, view]);
+  }, [galleryLoaded, job, view]);
 
   useEffect(() => {
     writeStoredJobId(active ? job.id : null);
@@ -259,11 +278,11 @@ export default function App() {
   useEffect(() => {
     if (!previewVideo) {
       document.body.style.overflow = "";
-      lenisRef.current?.start();
+      document.documentElement.style.overflow = "";
       return undefined;
     }
     document.body.style.overflow = "hidden";
-    lenisRef.current?.stop();
+    document.documentElement.style.overflow = "hidden";
     function handleEscape(event) {
       if (event.key === "Escape") {
         setPreviewVideo(null);
@@ -272,7 +291,7 @@ export default function App() {
     window.addEventListener("keydown", handleEscape);
     return () => {
       document.body.style.overflow = "";
-      lenisRef.current?.start();
+      document.documentElement.style.overflow = "";
       window.removeEventListener("keydown", handleEscape);
     };
   }, [previewVideo]);
@@ -579,7 +598,7 @@ export default function App() {
       {previewVideo && (
         <div className="lightbox" role="dialog" aria-modal="true" aria-label={videoTitle(previewVideo)}>
           <button className="lightbox-backdrop" type="button" onClick={closePreview} aria-label="Close preview" />
-          <div className="lightbox-panel">
+          <div className="lightbox-panel" data-lenis-prevent>
             <button className="lightbox-close" type="button" onClick={closePreview} aria-label="Close preview">
               Close
             </button>

@@ -97,40 +97,47 @@ def fit_image_to_frame(image_path: Path, width: int, height: int, darken: float)
     return fitted
 
 
-def make_text_overlay(quote: str, width: int, height: int, author: str | None = None, font_file: str | None = None) -> Image.Image:
+def make_text_overlay(
+    quote: str,
+    width: int,
+    height: int,
+    author: str | None = None,
+    quote_font_file: str | None = None,
+    author_font_file: str | None = None,
+) -> Image.Image:
     canvas = Image.new("RGBA", (width, height), (0, 0, 0, 0))
     draw = ImageDraw.Draw(canvas)
-    max_font = int(width * 0.074)
-    min_font = int(width * 0.028)
+    max_font = int(width * 0.069)
+    min_font = int(width * 0.03)
     font_size = max_font
-    quote_max_width = width * 0.72
-    quote_max_height = height * 0.34
+    quote_max_width = width * 0.7
+    quote_max_height = height * 0.31
     author_text = f"— {author.strip()}" if author and author.strip() else ""
 
     while font_size >= min_font:
-        quote_font = load_font(font_file, int(font_size))
-        author_font = load_font(font_file, max(int(font_size * 0.42), 22))
-        lines = balance_wrap(quote, width=max(12, int(20 * (width / 1080))))
+        quote_font = load_font(quote_font_file, int(font_size))
+        author_font = load_font(author_font_file or quote_font_file, max(int(font_size * 0.38), 22))
+        lines = balance_wrap(quote, width=max(11, int(19 * (width / 1080))))
         max_w = 0
         total_h = 0
         for line in lines:
             line_w, line_h = text_size(draw, line, quote_font, stroke_width=1)
             max_w = max(max_w, line_w)
             total_h += line_h
-        total_h += int((len(lines) - 1) * font_size * 0.16)
+        total_h += int((len(lines) - 1) * font_size * 0.13)
         if author_text:
             author_w, author_h = text_size(draw, author_text, author_font, stroke_width=0)
             max_w = max(max_w, author_w)
-            total_h += int(font_size * 0.48) + author_h
+            total_h += int(font_size * 0.52) + author_h
         if max_w <= quote_max_width and total_h <= quote_max_height:
             break
         font_size -= 6
 
-    quote_font = load_font(font_file, int(font_size))
-    author_font = load_font(font_file, max(int(font_size * 0.42), 22))
-    lines = balance_wrap(quote, width=max(12, int(20 * (width / 1080))))
-    line_gap = int(font_size * 0.14)
-    author_gap = int(font_size * 0.56)
+    quote_font = load_font(quote_font_file, int(font_size))
+    author_font = load_font(author_font_file or quote_font_file, max(int(font_size * 0.38), 22))
+    lines = balance_wrap(quote, width=max(11, int(19 * (width / 1080))))
+    line_gap = int(font_size * 0.11)
+    author_gap = int(font_size * 0.58)
     shadow_offset = (max(2, int(font_size * 0.018)), max(3, int(font_size * 0.028)))
     quote_metrics = [text_size(draw, line, quote_font, stroke_width=1) for line in lines]
     quote_height = sum(height_value for _, height_value in quote_metrics) + line_gap * max(len(lines) - 1, 0)
@@ -144,11 +151,11 @@ def make_text_overlay(quote: str, width: int, height: int, author: str | None = 
             (x, y),
             line,
             font=quote_font,
-            fill=(248, 244, 238, 255),
-            shadow_fill=(6, 8, 11, 120),
+            fill=(247, 247, 244, 255),
+            shadow_fill=(6, 8, 11, 126),
             shadow_offset=shadow_offset,
             stroke_width=1,
-            stroke_fill=(15, 18, 22, 140),
+            stroke_fill=(14, 18, 22, 112),
         )
         y += line_h + line_gap
 
@@ -161,8 +168,8 @@ def make_text_overlay(quote: str, width: int, height: int, author: str | None = 
             (x, y),
             author_text,
             font=author_font,
-            fill=(232, 226, 214, 230),
-            shadow_fill=(6, 8, 11, 96),
+            fill=(230, 236, 239, 232),
+            shadow_fill=(6, 8, 11, 86),
             shadow_offset=(shadow_offset[0], shadow_offset[1] + 1),
         )
     return canvas
@@ -176,11 +183,19 @@ def render_video(
     author: str | None,
     outname: str,
     darken: float,
-    font_file: str | None,
+    quote_font_file: str | None,
+    author_font_file: str | None,
     progress_callback: Callable[[str, float, str], None],
 ) -> Path:
     bg_pil = fit_image_to_frame(image_path, config.width, config.height, darken)
-    overlay_pil = make_text_overlay(quote, config.width, config.height, author=author, font_file=font_file)
+    overlay_pil = make_text_overlay(
+        quote,
+        config.width,
+        config.height,
+        author=author,
+        quote_font_file=quote_font_file,
+        author_font_file=author_font_file,
+    )
     bg_np = np.array(bg_pil)
     overlay_np = np.array(overlay_pil)
 
