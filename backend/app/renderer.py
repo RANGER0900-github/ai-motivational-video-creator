@@ -1,16 +1,13 @@
 from __future__ import annotations
 
 import logging
-import math
-import time
+import subprocess
+import tempfile
 from pathlib import Path
 from typing import Callable
 import textwrap
 
-import numpy as np
 from PIL import Image, ImageDraw, ImageEnhance, ImageFont, ImageOps
-from moviepy.audio.fx.all import audio_fadein
-from moviepy.editor import AudioFileClip, CompositeVideoClip, ImageClip, vfx
 
 from .config import AppConfig
 
@@ -187,6 +184,41 @@ def render_video(
     author_font_file: str | None,
     progress_callback: Callable[[str, float, str], None],
 ) -> Path:
+    def probe_duration(media_path: Path) -> float:
+        command = [
+            "ffprobe",
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+            str(media_path),
+        ]
+        result = subprocess.run(command, capture_output=True, text=True, check=True)
+        value = result.stdout.strip()
+        if not value:
+            raise RuntimeError(f"Could not determine duration for {media_path.name}")
+        return float(value)
+
+    def build_filtergraph(duration: float, fade_in: float) -> str:
+        safe_fade = min(fade_in, max(duration - 0.05, 0.1))
+        background_chain = (
+            f"[0:v]fps={config.fps},trim=duration={duration:.3f},setpts=PTS-STARTPTS,format=yuv420p,"
+            f"fade=t=in:st=0:d={safe_fade:.3f}[bg]"
+        )
+        overlay_chain = (
+            f"[1:v]fps={config.fps},trim=duration={duration:.3f},setpts=PTS-STARTPTS,format=rgba"
+        )
+        if config.text_fade > 0:
+            overlay_chain += f",fade=t=in:st=0:d={min(config.text_fade, duration):.3f}:alpha=1"
+        overlay_chain += "[txt]"
+        audio_chain = (
+            f"[2:a]atrim=duration={duration:.3f},asetpts=PTS-STARTPTS,"
+            f"afade=t=in:st=0:d={safe_fade:.3f}[a]"
+        )
+        return ";".join((background_chain, overlay_chain, audio_chain, "[bg][txt]overlay=0:0:format=auto[v]"))
+
     bg_pil = fit_image_to_frame(image_path, config.width, config.height, darken)
     overlay_pil = make_text_overlay(
         quote,
@@ -196,55 +228,113 @@ def render_video(
         quote_font_file=quote_font_file,
         author_font_file=author_font_file,
     )
-    bg_np = np.array(bg_pil)
-    overlay_np = np.array(overlay_pil)
 
     progress_callback("rendering", 0.35, "Preparing audio and timeline")
-    audio = AudioFileClip(str(music_path))
-    bg_clip = txt_clip = final = audio_fx = None
+    audio_dur = probe_duration(music_path)
+    duration = min(audio_dur, config.max_duration)
+    if duration <= 0:
+        raise RuntimeError(f"Audio track {music_path.name} has invalid duration")
+    fade_in = max(0.12, min(duration / 6.0, 1.1))
+    config.outputs_dir.mkdir(parents=True, exist_ok=True)
+    outpath = config.outputs_dir / outname
+
     try:
-        audio_dur = float(audio.duration)
-        duration = min(audio_dur, config.max_duration)
-        fade_in = max(0.1, audio_dur / 7.0)
+        with tempfile.TemporaryDirectory(prefix="render_", dir=str(config.state_dir)) as tmpdir:
+            tmpdir_path = Path(tmpdir)
+            bg_path = tmpdir_path / "background.png"
+            overlay_path = tmpdir_path / "overlay.png"
+            bg_pil.save(bg_path, format="PNG", optimize=True)
+            overlay_pil.save(overlay_path, format="PNG", optimize=True)
 
-        progress_callback("rendering", 0.52, "Building animation layers")
-        bg_clip = ImageClip(bg_np).set_duration(duration).set_fps(config.fps)
-        zoom_amount = 1.04
+            progress_callback("rendering", 0.52, "Building FFmpeg render graph")
+            command = [
+                "ffmpeg",
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-progress",
+                "pipe:1",
+                "-loop",
+                "1",
+                "-framerate",
+                str(config.fps),
+                "-i",
+                str(bg_path),
+                "-loop",
+                "1",
+                "-framerate",
+                str(config.fps),
+                "-i",
+                str(overlay_path),
+                "-i",
+                str(music_path),
+                "-filter_complex",
+                build_filtergraph(duration, fade_in),
+                "-map",
+                "[v]",
+                "-map",
+                "[a]",
+                "-c:v",
+                "libx264",
+                "-preset",
+                config.encoder_preset,
+                "-crf",
+                config.crf,
+                "-pix_fmt",
+                "yuv420p",
+                "-r",
+                str(config.fps),
+                "-threads",
+                str(config.encoder_threads),
+                "-c:a",
+                "aac",
+                "-movflags",
+                "+faststart",
+                "-shortest",
+                str(outpath),
+            ]
 
-        def zoom(t: float) -> float:
-            return 1 + (zoom_amount - 1) * (0.5 - 0.5 * math.cos(math.pi * (t / max(duration, 0.0001))))
+            progress_callback("rendering", 0.66, "Encoding video with FFmpeg")
+            process = subprocess.Popen(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                bufsize=1,
+            )
+            assert process.stdout is not None
+            progress = 0.66
+            try:
+                for raw_line in process.stdout:
+                    line = raw_line.strip()
+                    if not line or "=" not in line:
+                        continue
+                    key, value = line.split("=", 1)
+                    if key == "out_time_ms":
+                        try:
+                            encoded_seconds = max(0.0, int(value) / 1_000_000.0)
+                        except ValueError:
+                            continue
+                        ratio = min(1.0, encoded_seconds / max(duration, 0.001))
+                        next_progress = 0.66 + (0.28 * ratio)
+                        if next_progress - progress >= 0.01:
+                            progress = next_progress
+                            progress_callback("rendering", progress, "Encoding video with FFmpeg")
+                    elif key == "progress" and value == "end":
+                        progress_callback("finalizing", 0.94, "Finalizing output")
+                stderr_output = process.stderr.read() if process.stderr is not None else ""
+                return_code = process.wait()
+            finally:
+                if process.stdout is not None:
+                    process.stdout.close()
+                if process.stderr is not None:
+                    process.stderr.close()
+            if return_code != 0:
+                raise RuntimeError(stderr_output.strip() or f"ffmpeg exited with code {return_code}")
 
-        bg_clip = bg_clip.fx(vfx.resize, lambda t: zoom(t)).fx(vfx.fadein, fade_in)
-        txt_clip = ImageClip(overlay_np, ismask=False).set_duration(duration).set_position(("center", "center"))
-        if config.text_fade > 0:
-            txt_clip = txt_clip.fx(vfx.fadein, config.text_fade)
-        final = CompositeVideoClip([bg_clip, txt_clip], size=(config.width, config.height)).set_duration(duration)
-        audio_fx = audio.subclip(0, duration)
-        audio_fx = audio_fadein(audio_fx, fade_in)
-        final = final.set_audio(audio_fx)
-
-        config.outputs_dir.mkdir(parents=True, exist_ok=True)
-        outpath = config.outputs_dir / outname
-        progress_callback("rendering", 0.66, "Encoding video with FFmpeg")
-        final.write_videofile(
-            str(outpath),
-            fps=config.fps,
-            codec="libx264",
-            audio_codec="aac",
-            preset=config.encoder_preset,
-            threads=config.encoder_threads,
-            logger=None,
-            ffmpeg_params=["-crf", config.crf],
-        )
-        progress_callback("finalizing", 0.96, "Finalizing output")
+        progress_callback("finalizing", 0.98, "Finalizing output")
         return outpath
     finally:
-        for clip in (final, bg_clip, txt_clip, audio_fx, audio):
-            if clip is None:
-                continue
-            try:
-                clip.close()
-            except Exception:
-                logger.exception("Failed to close clip")
         bg_pil.close()
         overlay_pil.close()

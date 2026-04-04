@@ -17,14 +17,14 @@ class AppConfig:
     outputs_dir: Path
     quotes_csv: Path
     images_usage_json: Path
-    max_duration: float = 60.0
-    fps: int = 30
+    max_duration: float = 20.0
+    fps: int = 24
     width: int = 1080
     height: int = 1920
     text_fade: float = 0.5
     crf: str = "20"
-    encoder_preset: str = "medium"
-    encoder_threads: int = 2
+    encoder_preset: str = "veryfast"
+    encoder_threads: int = 4
     default_darken: float = 0.78
     default_workers: int = 1
 
