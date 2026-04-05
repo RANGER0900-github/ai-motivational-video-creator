@@ -257,7 +257,7 @@ class InstagramUploader:
         if await self.maybe_activate_saved_profile(login_password):
             await self.current_state("AFTER_PROFILE_PICKER")
         await self.ensure_authenticated()
-        if await self.page.locator('input[type="file"]').count():
+        if await self.page.locator('input[type="file"]').count() and await self.is_upload_prompt_visible():
             await self.confirm_target_account_context()
             return
         await self.page.goto("https://www.instagram.com/", wait_until="domcontentloaded")
@@ -369,12 +369,13 @@ class InstagramUploader:
         await self.page.wait_for_timeout(5000)
         await self.snap(label)
 
-    async def open_crop_menu(self) -> None:
+    async def open_crop_menu(self) -> bool:
         crop_toggle = self.page.locator('svg[aria-label="Select crop"]').locator("xpath=ancestor::*[@role='button' or self::button][1]")
         if await crop_toggle.count() == 0:
-            raise InstagramUploadError("Crop toggle was not found in the composer.")
+            return False
         await crop_toggle.first.click(force=True)
         await self.page.wait_for_timeout(1500)
+        return True
 
     async def crop_options(self) -> list[str]:
         dialog = self.page.locator('div[role="dialog"]').first
@@ -388,7 +389,8 @@ class InstagramUploader:
         return options
 
     async def select_crop_ratio(self, label: str) -> None:
-        await self.open_crop_menu()
+        if not await self.open_crop_menu():
+            return
         options = await self.crop_options()
         if label not in options:
             raise InstagramUploadError(
@@ -401,10 +403,13 @@ class InstagramUploader:
             raise InstagramUploadError(f"Crop option {label!r} had no visible bounding box.")
         await self.page.mouse.click(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
         await self.page.wait_for_timeout(1500)
-        await self.open_crop_menu()
+        if not await self.open_crop_menu():
+            return
         await self.page.wait_for_timeout(800)
 
     async def assert_crop_menu_closed(self) -> None:
+        if not await self.page.locator('svg[aria-label="Select crop"]').count():
+            return
         dialog = self.page.locator('div[role="dialog"]').first
         text = await dialog.inner_text()
         if "Original" in text and "1:1" in text and "9:16" in text and "16:9" in text:
