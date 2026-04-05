@@ -5,16 +5,14 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "ai-video-gen"
 version = "0.1.0"
-description = "Linux-friendly motivational video generator with web UI"
+description = "Linux-friendly motivational video generator with Telegram bot control"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-  "fastapi>=0.116.0,<1.0.0",
-  "uvicorn[standard]>=0.35.0,<1.0.0",
   "pandas>=2.2.0,<3.0.0",
   "pillow>=11.0.0,<12.0.0",
   "colorama>=0.4.6,<1.0.0",
-  "python-multipart>=0.0.20,<1.0.0"
+  "python-telegram-bot>=21.0,<22.0"
 ]
 
 [project.optional-dependencies]

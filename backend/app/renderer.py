@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import subprocess
 import tempfile
+import threading
 from pathlib import Path
 from typing import Callable
 import textwrap
@@ -15,6 +16,10 @@ logger = logging.getLogger(__name__)
 
 if not hasattr(Image, "ANTIALIAS"):
     Image.ANTIALIAS = Image.Resampling.LANCZOS
+
+
+class RenderCancelled(Exception):
+    pass
 
 
 def load_font(font_file: str | None, size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
@@ -183,6 +188,7 @@ def render_video(
     quote_font_file: str | None,
     author_font_file: str | None,
     progress_callback: Callable[[str, float, str], None],
+    cancel_event: threading.Event | None = None,
 ) -> Path:
     def probe_duration(media_path: Path) -> float:
         command = [
@@ -307,6 +313,14 @@ def render_video(
             progress = 0.66
             try:
                 for raw_line in process.stdout:
+                    if cancel_event is not None and cancel_event.is_set():
+                        process.terminate()
+                        try:
+                            process.wait(timeout=5)
+                        except subprocess.TimeoutExpired:
+                            process.kill()
+                            process.wait(timeout=5)
+                        raise RenderCancelled("Render cancelled")
                     line = raw_line.strip()
                     if not line or "=" not in line:
                         continue

@@ -11,7 +11,7 @@ from .config import AppConfig, check_runtime
 from .csv_store import QuoteStore
 from .database import Database, row_to_job, row_to_summary
 from .models import CreateJobRequest, JobDetail, JobSummary, ProgressEvent
-from .renderer import render_video
+from .renderer import RenderCancelled, render_video
 from .storage import AssetStore
 
 logger = logging.getLogger(__name__)
@@ -31,6 +31,9 @@ class JobService:
         self._queue: queue.Queue[int] = queue.Queue()
         self._stop = threading.Event()
         self._worker = threading.Thread(target=self._work_loop, name="render-worker", daemon=True)
+        self._active_lock = threading.Lock()
+        self._active_cancel: dict[int, threading.Event] = {}
+        self._active_job_id: int | None = None
 
     def start(self) -> None:
         if self._worker.is_alive():
@@ -41,10 +44,11 @@ class JobService:
 
     def stop(self) -> None:
         self._stop.set()
-        self._queue.put(-1)
-        self._worker.join(timeout=5)
+        if self._worker.is_alive():
+            self._queue.put(-1)
+            self._worker.join(timeout=5)
 
-    def create_jobs(self, payload: CreateJobRequest) -> list[JobSummary]:
+    def create_jobs(self, payload: CreateJobRequest, *, origin: str = "manual", chat_id: int | None = None, batch_id: int | None = None) -> list[JobSummary]:
         row_ids = payload.row_ids or []
         custom_quote = (payload.custom_quote or "").strip()
         custom_author = (payload.custom_author or "").strip() or None
@@ -64,6 +68,9 @@ class JobService:
                 music_name=payload.music_name,
                 darken=darken,
                 message=queued_message,
+                origin=origin,
+                chat_id=chat_id,
+                batch_id=batch_id,
             )
             self._queue.put(job_id)
             jobs.append(self.get_job(job_id, summary=True))
@@ -78,6 +85,9 @@ class JobService:
                 music_name=payload.music_name,
                 darken=darken,
                 message=queued_message,
+                origin=origin,
+                chat_id=chat_id,
+                batch_id=batch_id,
             )
             self._queue.put(job_id)
             jobs.append(self.get_job(job_id, summary=True))
@@ -88,6 +98,12 @@ class JobService:
         job = self.get_job(job_id)
         if job.status == "queued":
             self.context.db.cancel_job(job_id)
+            return
+        with self._active_lock:
+            cancel_event = self._active_cancel.get(job_id)
+        if cancel_event is not None and job.status in {"preparing", "rendering", "finalizing"}:
+            self._progress(job_id, job.status, job.progress, job.phase, "Cancelling render")
+            cancel_event.set()
 
     def get_job(self, job_id: int, summary: bool = False) -> JobDetail | JobSummary:
         row = self.context.db.get_job_row(job_id)
@@ -99,6 +115,12 @@ class JobService:
     def list_events(self, job_id: int, after_id: int = 0) -> list[ProgressEvent]:
         from .database import row_to_event
         return [row_to_event(row) for row in self.context.db.list_events(job_id, after_id)]
+
+    def has_active_job(self) -> bool:
+        return self.context.db.count_active_jobs() > 0
+
+    def list_delivery_pending_jobs(self) -> list[JobDetail]:
+        return [row_to_job(row) for row in self.context.db.list_completed_delivery_pending_rows()]
 
     def _progress(self, job_id: int, status: str, progress: float, phase: str, message: str, started: bool = False, completed: bool = False, output_path: str | None = None, error: str | None = None) -> None:
         self.context.db.update_job(job_id, status=status, progress=progress, phase=phase, message=message, started=started, completed=completed, output_path=output_path, error=error)
@@ -122,27 +144,35 @@ class JobService:
         job = self.get_job(job_id)
         if job.status == "cancelled":
             return
-
-        issues = check_runtime(self.context.config)
-        if issues:
-            self._progress(job_id, "failed", 1.0, "Failed", "; ".join(issues), started=True, completed=True, error="; ".join(issues))
-            return
-
-        self._progress(job_id, "preparing", 0.08, "Preparing", "Loading project assets", started=True)
-        image_path = self.context.assets.choose_image(job.image_name)
-        music_path = self.context.assets.choose_music(job.music_name)
-        quote_font_file = self.context.assets.default_quote_font()
-        author_font_file = self.context.assets.default_author_font()
-        self._progress(job_id, "preparing", 0.2, "Preparing", f"Using {image_path.name} with {music_path.name}")
-
-        outname = f"job_{job_id}_{int(time.time())}.mp4"
-
-        def emit(phase_status: str, progress: float, message: str) -> None:
-            status = "rendering" if phase_status == "rendering" else phase_status
-            phase_name = phase_status.capitalize()
-            self._progress(job_id, status, progress, phase_name, message, started=True)
+        cancel_event = threading.Event()
+        with self._active_lock:
+            self._active_job_id = job_id
+            self._active_cancel[job_id] = cancel_event
 
         try:
+            issues = check_runtime(self.context.config)
+            if issues:
+                self._progress(job_id, "failed", 1.0, "Failed", "; ".join(issues), started=True, completed=True, error="; ".join(issues))
+                return
+
+            if cancel_event.is_set():
+                self._progress(job_id, "cancelled", 1.0, "Cancelled", "Job cancelled before rendering", started=True, completed=True)
+                return
+
+            self._progress(job_id, "preparing", 0.08, "Preparing", "Loading project assets", started=True)
+            image_path = self.context.assets.choose_image(job.image_name)
+            music_path = self.context.assets.choose_music(job.music_name)
+            quote_font_file = self.context.assets.default_quote_font()
+            author_font_file = self.context.assets.default_author_font()
+            self._progress(job_id, "preparing", 0.2, "Preparing", f"Using {image_path.name} with {music_path.name}")
+
+            outname = f"job_{job_id}_{int(time.time())}.mp4"
+
+            def emit(phase_status: str, progress: float, message: str) -> None:
+                status = "rendering" if phase_status == "rendering" else phase_status
+                phase_name = phase_status.capitalize()
+                self._progress(job_id, status, progress, phase_name, message, started=True)
+
             outpath = render_video(
                 config=self.context.config,
                 image_path=image_path,
@@ -154,11 +184,15 @@ class JobService:
                 quote_font_file=quote_font_file,
                 author_font_file=author_font_file,
                 progress_callback=emit,
+                cancel_event=cancel_event,
             )
             relative_output = outpath.relative_to(self.context.config.root_dir).as_posix()
             if job.source_row_id is not None:
                 self.context.quotes.mark_quote_output(job.source_row_id, relative_output)
             self._progress(job_id, "completed", 1.0, "Completed", "Video ready for preview", output_path=relative_output, started=True, completed=True)
+        except RenderCancelled:
+            logger.info("Job %s cancelled", job_id)
+            self._progress(job_id, "cancelled", 1.0, "Cancelled", "Job cancelled", started=True, completed=True)
         except Exception as exc:
             logger.exception("Job %s failed", job_id)
             if job.source_row_id is not None:
@@ -167,3 +201,8 @@ class JobService:
                 except Exception:
                     logger.exception("Failed to update CSV for job %s", job_id)
             self._progress(job_id, "failed", 1.0, "Failed", str(exc), started=True, completed=True, error=str(exc))
+        finally:
+            with self._active_lock:
+                self._active_cancel.pop(job_id, None)
+                if self._active_job_id == job_id:
+                    self._active_job_id = None

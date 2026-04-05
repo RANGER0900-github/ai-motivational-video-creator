@@ -1,0 +1,930 @@
+from __future__ import annotations
+
+import asyncio
+import html
+import logging
+from contextlib import suppress
+from datetime import datetime, timezone
+from pathlib import Path
+
+from telegram import (
+    BotCommand,
+    BotCommandScopeAllPrivateChats,
+    ForceReply,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    InputFile,
+    MenuButtonCommands,
+    ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
+    Update,
+)
+from telegram.constants import ChatAction, ParseMode
+from telegram.error import BadRequest
+from telegram.ext import (
+    Application,
+    ApplicationBuilder,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
+
+from .config import AppConfig, load_config
+from .csv_store import QuoteStore
+from .database import Database, row_to_batch, row_to_bot_state, row_to_job
+from .jobs import JobContext, JobService
+from .models import CreateJobRequest, JobBatch, JobDetail
+from .storage import AssetStore
+from .youtube import (
+    DEFAULT_DESCRIPTION,
+    DEFAULT_TAGS,
+    DESCRIPTION_VERSION,
+    YouTubeQueueStore,
+    YouTubeQuotaExceeded,
+    YouTubeUploadError,
+    rename_uploaded_file,
+    upload_with_node,
+)
+
+logger = logging.getLogger(__name__)
+
+PAGE_SIZE = 5
+COUNT_PRESETS = (1, 3, 5, 10)
+ACTIVE_STATUSES = {"queued", "preparing", "rendering", "finalizing"}
+
+
+def utcnow_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def ascii_bar(progress: float, width: int = 18) -> str:
+    progress = max(0.0, min(1.0, progress))
+    filled = min(width, int(round(progress * width)))
+    return f"[{'=' * filled}{'>' if filled < width else ''}{'.' * max(0, width - filled - (1 if filled < width else 0))}]"
+
+
+class TelegramBotRuntime:
+    def __init__(self, config: AppConfig):
+        self.config = config
+        self.db = Database(config.db_path)
+        self.quotes = QuoteStore(config.quotes_csv)
+        self.assets = AssetStore(config)
+        self.job_service = JobService(JobContext(config=config, db=self.db, assets=self.assets, quotes=self.quotes))
+        self._background_task: asyncio.Task | None = None
+        self._batch_text_cache: dict[int, str] = {}
+        self._chat_action_tasks: dict[int, tuple[str, asyncio.Task]] = {}
+        self.youtube_queue = YouTubeQueueStore(config)
+        self._youtube_upload_task: asyncio.Task | None = None
+
+    async def post_init(self, application: Application) -> None:
+        if not self.config.telegram_bot_token:
+            raise RuntimeError("AI_VIDEO_GEN_TELEGRAM_BOT_TOKEN is not configured")
+        if not self.config.allowed_chat_ids:
+            raise RuntimeError("AI_VIDEO_GEN_ALLOWED_CHAT_IDS is not configured")
+        self.quotes.normalize()
+        self.job_service.start()
+        self.db.update_bot_state(last_startup_at=utcnow_iso())
+        await application.bot.delete_webhook(drop_pending_updates=False)
+        await application.bot.set_my_commands(
+            commands=[
+                BotCommand("start", "Open the control panel"),
+                BotCommand("generate_video", "Generate one or more new videos"),
+                BotCommand("video_loop", "Start infinite one-by-one generation"),
+                BotCommand("list", "List completed videos"),
+                BotCommand("status", "Show queue and loop status"),
+                BotCommand("stop", "Stop loop mode and cancel loop work"),
+            ],
+            scope=BotCommandScopeAllPrivateChats(),
+        )
+        await application.bot.set_chat_menu_button(menu_button=MenuButtonCommands())
+        self._background_task = asyncio.create_task(self._background_loop(application), name="telegram-bot-background")
+
+    async def post_shutdown(self, application: Application) -> None:
+        task = self._background_task
+        if task is not None:
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
+        if self._youtube_upload_task is not None:
+            self._youtube_upload_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self._youtube_upload_task
+        for _, action_task in self._chat_action_tasks.values():
+            action_task.cancel()
+        for _, action_task in self._chat_action_tasks.values():
+            with suppress(asyncio.CancelledError):
+                await action_task
+        self._chat_action_tasks.clear()
+        self.job_service.stop()
+
+    def completed_jobs(self) -> list[JobDetail]:
+        jobs = [self.job_service.get_job(job.id) for job in self.job_service.list_jobs() if job.status == "completed" and job.output_path]
+        playable: list[JobDetail] = []
+        for job in jobs:
+            if job.output_path and (self.config.root_dir / job.output_path).exists():
+                playable.append(job)
+        return sorted(playable, key=lambda item: item.completed_at or item.updated_at, reverse=True)
+
+    def bot_state(self):
+        return row_to_bot_state(self.db.get_bot_state_row())
+
+    def open_batches(self) -> list[JobBatch]:
+        return [row_to_batch(row) for row in self.db.list_open_batches()]
+
+    def is_allowed_chat(self, chat_id: int | None) -> bool:
+        return chat_id is not None and chat_id in self.config.allowed_chat_ids
+
+    def active_jobs(self) -> list[JobDetail]:
+        return [self.job_service.get_job(job.id) for job in self.job_service.list_jobs() if job.status in ACTIVE_STATUSES]
+
+    def active_loop_jobs(self) -> list[JobDetail]:
+        return [job for job in self.active_jobs() if job.origin == "loop"]
+
+    def recent_loop_job(self) -> JobDetail | None:
+        for job in [self.job_service.get_job(item.id) for item in self.job_service.list_jobs()]:
+            if job.origin == "loop":
+                return job
+        return None
+
+    def status_text(self) -> str:
+        jobs = self.job_service.list_jobs()
+        active = [job for job in jobs if job.status in ACTIVE_STATUSES]
+        completed = [job for job in jobs if job.status == "completed"]
+        failed = [job for job in jobs if job.status == "failed"]
+        state = self.bot_state()
+        yt = self.youtube_queue.status_summary()
+        lines = [
+            "📊 <b>Generator Status</b>",
+            f"🔁 Loop: <b>{'ON' if state.loop_enabled else 'OFF'}</b>",
+            f"▶️ YouTube auto-post: <b>{'ON' if state.loop_youtube_enabled else 'OFF'}</b>",
+            f"🎬 In progress: <b>{len(active)}</b>",
+            f"✅ Completed: <b>{len(completed)}</b>",
+            f"❌ Failed: <b>{len(failed)}</b>",
+            f"📺 YT pending: <b>{yt['pending']}</b> · Uploaded today: <b>{yt['estimated_uploads_today']}</b>",
+        ]
+        if yt["quota_blocked"]:
+            lines.append("⏳ YouTube quota blocked until the next Pacific day reset")
+        if active:
+            current = active[0]
+            lines.extend(
+                [
+                    "",
+                    f"Now running: <b>Job #{current.id}</b>",
+                    f"{html.escape(current.phase)} · {current.progress * 100:.0f}%",
+                    html.escape(current.message),
+                ]
+            )
+        elif completed:
+            last = completed[0]
+            lines.extend(
+                [
+                    "",
+                    f"Last done: <b>Job #{last.id}</b>",
+                    html.escape((last.quote[:90] + "...") if len(last.quote) > 90 else last.quote),
+                ]
+            )
+        return "\n".join(lines)
+
+    async def _background_loop(self, application: Application) -> None:
+        while True:
+            try:
+                await self._tick(application)
+            except Exception:
+                logger.exception("Background loop tick failed")
+            await asyncio.sleep(3)
+
+    async def _tick(self, application: Application) -> None:
+        await self._maintain_loop(application)
+        await self._deliver_completed_jobs(application)
+        await self._maybe_process_youtube_queue(application)
+        await self._refresh_batches(application)
+        await self._sync_chat_actions(application)
+        state = self.bot_state()
+        if state.stop_requested and not self.active_loop_jobs():
+            self.db.update_bot_state(stop_requested=False)
+
+    async def _maybe_process_youtube_queue(self, application: Application) -> None:
+        if self._youtube_upload_task is not None and not self._youtube_upload_task.done():
+            return
+        item = self.youtube_queue.next_ready_item()
+        if item is None:
+            return
+        self._youtube_upload_task = asyncio.create_task(
+            self._upload_queued_video(application, item["job_id"]),
+            name=f"youtube-upload-{item['job_id']}",
+        )
+
+    async def _upload_queued_video(self, application: Application, job_id: int) -> None:
+        try:
+            item = self.youtube_queue.mark_uploading(job_id)
+            job = self.job_service.get_job(job_id)
+            if not job.output_path:
+                raise FileNotFoundError(f"Job #{job_id} has no output_path")
+            output_path = self.config.root_dir / job.output_path
+            if not output_path.exists():
+                raise FileNotFoundError(f"Output file missing for job #{job_id}: {output_path}")
+            result = await upload_with_node(
+                self.config,
+                video_path=output_path,
+                title=item["title"],
+                description=DEFAULT_DESCRIPTION,
+                tags=list(DEFAULT_TAGS),
+                privacy_status=item.get("privacy_status", self.config.youtube_privacy_status),
+                category_id=item.get("category_id", self.config.youtube_category_id),
+            )
+            new_output_path, renamed = rename_uploaded_file(self.config.root_dir, job.output_path)
+            self.db.update_job_output_path(job.id, new_output_path)
+            queue_item = self.youtube_queue.mark_uploaded(
+                job.id,
+                result=result,
+                new_output_path=new_output_path,
+                renamed_yt_done=renamed,
+            )
+            if job.chat_id is not None:
+                await application.bot.send_message(
+                    chat_id=job.chat_id,
+                    text=self._youtube_success_text(queue_item),
+                    parse_mode=ParseMode.HTML,
+                    reply_to_message_id=job.telegram_message_id,
+                )
+        except YouTubeQuotaExceeded as exc:
+            item = self.youtube_queue.mark_failed(job_id, str(exc), quota_exceeded=True)
+            chat_id = item.get("chat_id")
+            if chat_id:
+                summary = self.youtube_queue.status_summary()
+                await application.bot.send_message(
+                    chat_id=chat_id,
+                    text=(
+                        "⚠️ <b>YouTube quota is over for today</b>\n"
+                        f"Saved for tomorrow: <b>{summary['pending']}</b> pending upload(s)."
+                    ),
+                    parse_mode=ParseMode.HTML,
+                )
+        except Exception as exc:
+            item = self.youtube_queue.mark_failed(job_id, str(exc), quota_exceeded=False)
+            chat_id = item.get("chat_id")
+            if chat_id:
+                await application.bot.send_message(
+                    chat_id=chat_id,
+                    text=(
+                        "⚠️ <b>YouTube upload failed</b>\n"
+                        f"Job #{job_id} is still queued for retry.\n"
+                        f"<code>{html.escape(str(exc)[:300])}</code>"
+                    ),
+                    parse_mode=ParseMode.HTML,
+                )
+        finally:
+            self._youtube_upload_task = None
+
+    def _youtube_success_text(self, item: dict[str, object]) -> str:
+        title = html.escape(str(item.get("title", "")))
+        shorts = html.escape(str(item.get("youtube_shorts_url", "")))
+        return "\n".join(
+            [
+                "📺 <b>Uploaded to YouTube</b>",
+                "",
+                f"🎬 {title}",
+                "",
+                "🔗 <b>YouTube URL:</b>",
+                shorts,
+            ]
+        )
+
+    def _youtube_queue_text(self, item: dict[str, object]) -> str:
+        status = str(item.get("youtube_status", "pending"))
+        if status == "uploaded":
+            return self._youtube_success_text(item)
+        if status == "uploading":
+            return "📺 <b>YouTube upload in progress</b>\nYour video is being uploaded now."
+        if status == "quota_blocked":
+            return "⏳ <b>YouTube quota is over for today</b>\nThis video is saved and will upload automatically tomorrow."
+        if status == "failed":
+            detail = html.escape(str(item.get("last_error", "Previous upload failed")))
+            return f"⚠️ <b>YouTube upload will retry</b>\n<code>{detail[:300]}</code>"
+        return "📺 <b>Added to YouTube queue</b>\nYour video will upload automatically."
+
+    def _youtube_upload_markup(self, job: JobDetail) -> InlineKeyboardMarkup | None:
+        if job.status != "completed" or not job.output_path:
+            return None
+        if job.origin == "loop" and self.bot_state().loop_youtube_enabled:
+            return None
+        return InlineKeyboardMarkup(
+            [[InlineKeyboardButton("📺 Upload to YouTube", callback_data=f"ytup:{job.id}")]]
+        )
+
+    async def _sync_chat_actions(self, application: Application) -> None:
+        desired: dict[int, str] = {}
+        for batch in self.open_batches():
+            if batch.status not in {"queued", "active"}:
+                continue
+            if batch.kind == "resend":
+                desired[batch.chat_id] = ChatAction.UPLOAD_VIDEO
+            else:
+                desired.setdefault(batch.chat_id, ChatAction.TYPING)
+        for job in self.job_service.list_delivery_pending_jobs():
+            if job.chat_id is not None:
+                desired[job.chat_id] = ChatAction.UPLOAD_VIDEO
+
+        active_chat_ids = set(self._chat_action_tasks)
+        desired_chat_ids = set(desired)
+        for chat_id in active_chat_ids - desired_chat_ids:
+            _, task = self._chat_action_tasks.pop(chat_id)
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
+
+        for chat_id, action in desired.items():
+            current = self._chat_action_tasks.get(chat_id)
+            if current and current[0] == action and not current[1].done():
+                continue
+            if current:
+                current[1].cancel()
+                with suppress(asyncio.CancelledError):
+                    await current[1]
+            task = asyncio.create_task(self._chat_action_loop(application, chat_id, action), name=f"chat-action-{chat_id}")
+            self._chat_action_tasks[chat_id] = (action, task)
+
+    async def _chat_action_loop(self, application: Application, chat_id: int, action: str) -> None:
+        while True:
+            try:
+                await application.bot.send_chat_action(chat_id=chat_id, action=action)
+            except Exception:
+                logger.exception("Failed to send chat action %s to %s", action, chat_id)
+            await asyncio.sleep(4)
+
+    async def _maintain_loop(self, application: Application) -> None:
+        state = self.bot_state()
+        if not state.loop_enabled or not state.loop_chat_id:
+            return
+        if self.db.count_active_jobs_by_origin("loop") > 0:
+            return
+        recent = self.recent_loop_job()
+        if recent and recent.status == "failed" and recent.completed_at is not None:
+            elapsed = (datetime.now(timezone.utc) - recent.completed_at).total_seconds()
+            if elapsed < self.config.loop_backoff_seconds:
+                return
+        self.job_service.create_jobs(CreateJobRequest(), origin="loop", chat_id=state.loop_chat_id)
+
+    async def _deliver_completed_jobs(self, application: Application) -> None:
+        pending = self.job_service.list_delivery_pending_jobs()
+        for job in pending:
+            if job.chat_id is None:
+                self.db.update_job(
+                    job.id,
+                    status=job.status,
+                    progress=job.progress,
+                    phase=job.phase,
+                    message=job.message,
+                    delivery_status="skipped",
+                    delivery_message="No chat_id configured for delivery",
+                )
+                continue
+            failure_count = self.db.count_delivery_attempts(job.id, status="failed")
+            if failure_count >= self.config.send_retries:
+                self.db.update_job(
+                    job.id,
+                    status=job.status,
+                    progress=job.progress,
+                    phase=job.phase,
+                    message=job.message,
+                    delivery_status="skipped",
+                    delivery_message=f"Skipped after {failure_count} failed delivery attempts",
+                )
+                self.db.append_delivery_log(job.id, job.chat_id, "skipped", "Retry limit reached")
+                continue
+            try:
+                await self.send_single_video(application, job, chat_id=job.chat_id, mark_delivery=True)
+                if job.origin == "loop" and self.bot_state().loop_youtube_enabled:
+                    self.youtube_queue.enqueue_loop_job(self.job_service.get_job(job.id))
+            except Exception as exc:
+                logger.exception("Failed to deliver job %s", job.id)
+                self.db.update_job(
+                    job.id,
+                    status=job.status,
+                    progress=job.progress,
+                    phase=job.phase,
+                    message=job.message,
+                    delivery_status="failed",
+                    delivery_message=str(exc)[:300],
+                )
+                self.db.append_delivery_log(job.id, job.chat_id, "failed", str(exc)[:300])
+                if job.origin == "loop":
+                    await application.bot.send_message(
+                        chat_id=job.chat_id,
+                        text=f"⚠️ Loop delivery failed for Job #{job.id}\n<code>{html.escape(str(exc)[:300])}</code>",
+                        parse_mode=ParseMode.HTML,
+                    )
+
+    async def _refresh_batches(self, application: Application) -> None:
+        for batch in self.open_batches():
+            if batch.kind == "resend":
+                refreshed = row_to_batch(self.db.get_batch_row(batch.id))
+                if refreshed.progress_message_id:
+                    text = self._batch_progress_text(refreshed, [])
+                    cached = self._batch_text_cache.get(refreshed.id)
+                    if text != cached:
+                        refreshed = await self._publish_batch_progress(application, refreshed, text)
+                        self._batch_text_cache[refreshed.id] = text
+                continue
+            rows = self.db.list_jobs_for_batch(batch.id)
+            jobs = [row_to_job(row) for row in rows]
+            completed = sum(1 for job in jobs if job.status == "completed")
+            failed = sum(1 for job in jobs if job.status in {"failed", "cancelled"})
+            final = completed + failed
+            sent = sum(1 for job in jobs if job.delivery_status == "sent")
+            if final == 0:
+                status = "queued"
+            elif final < batch.requested_count or sent < completed:
+                status = "active"
+            elif completed > 0:
+                status = "completed"
+            else:
+                status = "failed"
+            self.db.update_batch(batch.id, completed_count=completed, failed_count=failed, status=status)
+            refreshed = row_to_batch(self.db.get_batch_row(batch.id))
+            if refreshed.progress_message_id:
+                text = self._batch_progress_text(refreshed, jobs)
+                cached = self._batch_text_cache.get(refreshed.id)
+                if text != cached:
+                    refreshed = await self._publish_batch_progress(application, refreshed, text)
+                    self._batch_text_cache[refreshed.id] = text
+
+    async def _publish_batch_progress(self, application: Application, batch: JobBatch, text: str) -> JobBatch:
+        if batch.progress_message_id is not None:
+            try:
+                await application.bot.edit_message_text(
+                    chat_id=batch.chat_id,
+                    message_id=batch.progress_message_id,
+                    text=text,
+                    parse_mode=ParseMode.HTML,
+                )
+                return batch
+            except BadRequest as exc:
+                logger.warning("Batch %s progress message not editable: %s", batch.id, exc)
+        message = await application.bot.send_message(
+            chat_id=batch.chat_id,
+            text=text,
+            parse_mode=ParseMode.HTML,
+        )
+        self.db.update_batch(batch.id, progress_message_id=message.message_id)
+        return row_to_batch(self.db.get_batch_row(batch.id))
+
+    def _batch_progress_text(self, batch: JobBatch, jobs: list[JobDetail]) -> str:
+        if batch.kind == "resend":
+            sent = batch.completed_count
+            failed = batch.failed_count
+            total = max(batch.requested_count, 1)
+            progress = sent / total if batch.status == "completed" else min(0.98, sent / total)
+            if failed and sent == 0 and batch.status == "failed":
+                progress = 1.0
+            percent = int(round(progress * 100))
+            return f"{ascii_bar(progress)} {percent:>3d}%"
+        completed = sum(1 for job in jobs if job.status == "completed")
+        failed = sum(1 for job in jobs if job.status in {"failed", "cancelled"})
+        total = max(batch.requested_count, 1)
+        sent = sum(1 for job in jobs if job.delivery_status == "sent")
+        current_job = next((job for job in jobs if job.status in ACTIVE_STATUSES), None)
+        blended_progress = sent / total
+        if current_job:
+            blended_progress = ((completed + current_job.progress) / total) * 0.92
+        elif completed and sent < completed:
+            blended_progress = min(0.98, completed / total)
+        elif completed == total and sent == total:
+            blended_progress = 1.0
+        elif failed and completed == 0 and batch.status == "failed":
+            blended_progress = 1.0
+        percent = int(round(max(0.0, min(1.0, blended_progress)) * 100))
+        return f"{ascii_bar(blended_progress)} {percent:>3d}%"
+
+    async def send_single_video(self, application: Application, job: JobDetail, *, chat_id: int, mark_delivery: bool) -> None:
+        output_path = self.config.root_dir / (job.output_path or "")
+        if not output_path.exists():
+            raise FileNotFoundError(f"Missing output file for job {job.id}")
+        caption = self._video_caption(job)
+        if job.telegram_file_id:
+            message = await application.bot.send_video(
+                chat_id=chat_id,
+                video=job.telegram_file_id,
+                caption=caption,
+                parse_mode=ParseMode.HTML,
+                supports_streaming=True,
+                reply_markup=self._youtube_upload_markup(job),
+            )
+        else:
+            with output_path.open("rb") as handle:
+                message = await application.bot.send_video(
+                    chat_id=chat_id,
+                    video=InputFile(handle, filename=output_path.name),
+                    caption=caption,
+                    parse_mode=ParseMode.HTML,
+                    supports_streaming=True,
+                    reply_markup=self._youtube_upload_markup(job),
+                )
+        telegram_file_id = message.video.file_id if message.video else None
+        if mark_delivery:
+            self.db.update_job(
+                job.id,
+                status=job.status,
+                progress=job.progress,
+                phase=job.phase,
+                message=job.message,
+                delivery_status="sent",
+                delivery_message="Delivered to Telegram",
+                delivered_at=utcnow_iso(),
+                telegram_file_id=telegram_file_id,
+                telegram_message_id=message.message_id,
+            )
+        elif telegram_file_id and not job.telegram_file_id:
+            self.db.update_job(
+                job.id,
+                status=job.status,
+                progress=job.progress,
+                phase=job.phase,
+                message=job.message,
+                telegram_file_id=telegram_file_id,
+            )
+        self.db.append_delivery_log(job.id, chat_id, "sent", "Video sent")
+
+    async def send_many_videos(self, application: Application, chat_id: int, jobs: list[JobDetail], batch_id: int | None = None) -> None:
+        if not jobs:
+            return
+        sent = 0
+        failed = 0
+        try:
+            for job in jobs:
+                try:
+                    await self.send_single_video(application, job, chat_id=chat_id, mark_delivery=False)
+                    sent += 1
+                except Exception as exc:
+                    failed += 1
+                    logger.exception("Failed to resend job %s", job.id)
+                    self.db.append_delivery_log(job.id, chat_id, "failed", f"Resend failed: {str(exc)[:300]}")
+                if batch_id is not None:
+                    self.db.update_batch(batch_id, completed_count=sent, failed_count=failed, status="active")
+            if batch_id is not None:
+                self.db.update_batch(batch_id, completed_count=sent, failed_count=failed, status="completed" if sent else "failed")
+                await application.bot.send_message(
+                    chat_id=chat_id,
+                    text=f"📦 Send batch finished.\nSent: <b>{sent}</b>\nFailed: <b>{failed}</b>",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=main_keyboard(),
+                )
+        except Exception:
+            if batch_id is not None:
+                self.db.update_batch(batch_id, completed_count=sent, failed_count=failed + 1, status="failed")
+            raise
+
+    def _video_caption(self, job: JobDetail) -> str:
+        quote_text = job.quote.strip()
+        if len(quote_text) > 700:
+            quote_text = f"{quote_text[:697].rstrip()}..."
+        quote = html.escape(quote_text)
+        author = html.escape((job.author or "Unknown").strip())
+        return "\n".join(
+            [
+                "🎬 <b>Motivational Video Ready</b>",
+                "",
+                quote,
+                f"— <i>{author}</i>",
+                "",
+                f"<b>Job #{job.id}</b>",
+            ]
+        )
+
+
+def main_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        [
+            ["🎬 Generate Video", "🔁 Video Loop"],
+            ["📚 List Videos", "📊 Status"],
+            ["🛑 Stop"],
+        ],
+        resize_keyboard=True,
+    )
+
+
+async def ensure_allowed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    runtime: TelegramBotRuntime = context.application.bot_data["runtime"]
+    chat_id = update.effective_chat.id if update.effective_chat else None
+    if runtime.is_allowed_chat(chat_id):
+        return True
+    if update.effective_chat:
+        await context.bot.send_message(chat_id=update.effective_chat.id, text="🚫 This bot is locked to its owner chat.")
+    return False
+
+
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await ensure_allowed(update, context):
+        return
+    runtime: TelegramBotRuntime = context.application.bot_data["runtime"]
+    text = "\n".join(
+        [
+            "✨ <b>AI Motivational Video Creator</b>",
+            "Generate videos, run an infinite loop, list completed outputs, and manage everything from Telegram.",
+            "",
+            runtime.status_text(),
+        ]
+    )
+    await update.effective_message.reply_text(text=text, parse_mode=ParseMode.HTML, reply_markup=main_keyboard())
+
+
+async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await ensure_allowed(update, context):
+        return
+    runtime: TelegramBotRuntime = context.application.bot_data["runtime"]
+    await update.effective_message.reply_text(runtime.status_text(), parse_mode=ParseMode.HTML, reply_markup=main_keyboard())
+
+
+async def generate_video_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await ensure_allowed(update, context):
+        return
+    keyboard = InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton(str(count), callback_data=f"gen:{count}") for count in COUNT_PRESETS],
+            [InlineKeyboardButton("Custom", callback_data="gen:custom")],
+        ]
+    )
+    await update.effective_message.reply_text(
+        "🎬 <b>How many videos should I generate?</b>",
+        parse_mode=ParseMode.HTML,
+        reply_markup=keyboard,
+    )
+
+
+async def video_loop_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await ensure_allowed(update, context):
+        return
+    runtime: TelegramBotRuntime = context.application.bot_data["runtime"]
+    chat_id = update.effective_chat.id
+    state = runtime.bot_state()
+    if state.loop_enabled and state.loop_chat_id == chat_id:
+        mode = "Telegram + YouTube" if state.loop_youtube_enabled else "Telegram only"
+        await update.effective_message.reply_text(f"🔁 Loop mode is already running.\nMode: <b>{mode}</b>", parse_mode=ParseMode.HTML, reply_markup=main_keyboard())
+        return
+    markup = InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("📺 Yes, Telegram + YouTube", callback_data="loopyt:on")],
+            [InlineKeyboardButton("💬 No, Telegram only", callback_data="loopyt:off")],
+        ]
+    )
+    await update.effective_message.reply_text(
+        "🔁 <b>Want your generated videos to auto post on YouTube too?</b>",
+        parse_mode=ParseMode.HTML,
+        reply_markup=markup,
+    )
+
+
+async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await ensure_allowed(update, context):
+        return
+    runtime: TelegramBotRuntime = context.application.bot_data["runtime"]
+    runtime.db.update_bot_state(loop_enabled=False, loop_youtube_enabled=False, stop_requested=True)
+    loop_jobs = [job for job in runtime.active_loop_jobs()]
+    for job in loop_jobs:
+        runtime.job_service.cancel_job(job.id)
+    await update.effective_message.reply_text(
+        "🛑 <b>Loop stop requested</b>\nQueued and active loop jobs are being cancelled now.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=main_keyboard(),
+    )
+
+
+async def list_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await ensure_allowed(update, context):
+        return
+    runtime: TelegramBotRuntime = context.application.bot_data["runtime"]
+    await send_list_page(update.effective_chat.id, context, runtime, page=0)
+
+
+async def send_list_page(chat_id: int, context: ContextTypes.DEFAULT_TYPE, runtime: TelegramBotRuntime, page: int, query_message=None) -> None:
+    videos = runtime.completed_jobs()
+    if not videos:
+        text = "📚 No completed videos are available yet."
+        if query_message:
+            await query_message.edit_text(text)
+        else:
+            await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=main_keyboard())
+        return
+    total_pages = max(1, (len(videos) + PAGE_SIZE - 1) // PAGE_SIZE)
+    page = max(0, min(page, total_pages - 1))
+    start = page * PAGE_SIZE
+    chunk = videos[start : start + PAGE_SIZE]
+    lines = [f"📚 <b>Completed Videos</b> · Page {page + 1}/{total_pages}", ""]
+    keyboard_rows = []
+    for job in chunk:
+        title = html.escape((job.quote[:54] + "...") if len(job.quote) > 54 else job.quote)
+        lines.append(f"#{job.id} · {title}")
+        keyboard_rows.append([InlineKeyboardButton(f"▶ Send #{job.id}", callback_data=f"send:{job.id}")])
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"list:{page - 1}"))
+    if page < total_pages - 1:
+        nav.append(InlineKeyboardButton("➡️ Next", callback_data=f"list:{page + 1}"))
+    if nav:
+        keyboard_rows.append(nav)
+    keyboard_rows.append(
+        [
+            InlineKeyboardButton("📥 Send Page", callback_data=f"page:{page}"),
+            InlineKeyboardButton("📦 Send All", callback_data="all"),
+        ]
+    )
+    markup = InlineKeyboardMarkup(keyboard_rows)
+    text = "\n".join(lines)
+    if query_message:
+        await query_message.edit_text(text=text, parse_mode=ParseMode.HTML, reply_markup=markup)
+    else:
+        await context.bot.send_message(chat_id=chat_id, text=text, parse_mode=ParseMode.HTML, reply_markup=markup)
+
+
+async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await ensure_allowed(update, context):
+        return
+    runtime: TelegramBotRuntime = context.application.bot_data["runtime"]
+    query = update.callback_query
+    data = query.data or ""
+    if data.startswith("ytup:"):
+        job_id = int(data.split(":", 1)[1])
+        job = runtime.job_service.get_job(job_id)
+        if job.status != "completed" or not job.output_path:
+            await query.answer("This video is not ready for YouTube upload yet.", show_alert=True)
+            return
+        item = runtime.youtube_queue.get_item(job_id)
+        if item is None or str(item.get("youtube_status")) == "failed":
+            item = runtime.youtube_queue.enqueue_job(runtime.job_service.get_job(job_id), youtube_enabled_for_origin=False)
+        await runtime._maybe_process_youtube_queue(context.application)
+        status = str(item.get("youtube_status", "pending"))
+        if status == "uploaded":
+            await query.answer()
+            await query.message.reply_text(
+                runtime._youtube_success_text(item),
+                parse_mode=ParseMode.HTML,
+                reply_markup=main_keyboard(),
+                reply_to_message_id=job.telegram_message_id,
+            )
+            return
+        if status == "quota_blocked":
+            await query.answer()
+            await query.message.reply_text(
+                runtime._youtube_queue_text(item),
+                parse_mode=ParseMode.HTML,
+                reply_markup=main_keyboard(),
+                reply_to_message_id=job.telegram_message_id,
+            )
+            return
+        if status == "failed":
+            await query.answer()
+            await query.message.reply_text(
+                runtime._youtube_queue_text(item),
+                parse_mode=ParseMode.HTML,
+                reply_markup=main_keyboard(),
+                reply_to_message_id=job.telegram_message_id,
+            )
+            return
+        if status == "uploading":
+            await query.answer("YouTube upload is already in progress.")
+            return
+        await query.answer("Added to YouTube queue.")
+        return
+
+    await query.answer()
+    if data.startswith("gen:"):
+        token = data.split(":", 1)[1]
+        if token == "custom":
+            context.user_data["awaiting_custom_count"] = True
+            await query.message.reply_text(
+                "✍️ Reply with the number of videos to generate.",
+                reply_markup=ForceReply(selective=True),
+            )
+            return
+        await create_generation_batch(update.effective_chat.id, context, int(token))
+        return
+    if data.startswith("loopyt:"):
+        enabled = data.split(":", 1)[1] == "on"
+        runtime.db.update_bot_state(
+            loop_enabled=True,
+            loop_chat_id=update.effective_chat.id,
+            loop_youtube_enabled=enabled,
+            loop_started_at=utcnow_iso(),
+            stop_requested=False,
+        )
+        mode = "Telegram + YouTube" if enabled else "Telegram only"
+        await query.message.reply_text(
+            f"🔁 <b>Video loop enabled</b>\nMode: <b>{mode}</b>\nI’ll keep generating videos until you send /stop.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=main_keyboard(),
+        )
+        return
+    if data.startswith("list:"):
+        await send_list_page(update.effective_chat.id, context, runtime, int(data.split(":", 1)[1]), query.message)
+        return
+    if data.startswith("send:"):
+        job_id = int(data.split(":", 1)[1])
+        job = runtime.job_service.get_job(job_id)
+        await runtime.send_single_video(context.application, job, chat_id=update.effective_chat.id, mark_delivery=False)
+        await query.message.reply_text(f"📤 Sent Job #{job.id}.", reply_markup=main_keyboard())
+        return
+    if data.startswith("page:"):
+        page = int(data.split(":", 1)[1])
+        videos = runtime.completed_jobs()
+        start = page * PAGE_SIZE
+        chunk = videos[start : start + PAGE_SIZE]
+        if not chunk:
+            await query.message.reply_text("Nothing to send on this page.", reply_markup=main_keyboard())
+            return
+        progress = await query.message.reply_text("📥 Sending this page...", reply_markup=ReplyKeyboardRemove())
+        batch_id = runtime.db.create_batch(chat_id=update.effective_chat.id, kind="resend", requested_count=len(chunk), progress_message_id=progress.message_id)
+        runtime._batch_text_cache.pop(batch_id, None)
+        context.application.create_task(runtime.send_many_videos(context.application, update.effective_chat.id, chunk, batch_id=batch_id))
+        return
+    if data == "all":
+        videos = runtime.completed_jobs()
+        if not videos:
+            await query.message.reply_text("No videos available to send.", reply_markup=main_keyboard())
+            return
+        progress = await query.message.reply_text("📦 Sending all completed videos in batches...", reply_markup=ReplyKeyboardRemove())
+        batch_id = runtime.db.create_batch(chat_id=update.effective_chat.id, kind="resend", requested_count=len(videos), progress_message_id=progress.message_id)
+        runtime._batch_text_cache.pop(batch_id, None)
+        context.application.create_task(runtime.send_many_videos(context.application, update.effective_chat.id, videos, batch_id=batch_id))
+
+
+async def create_generation_batch(chat_id: int, context: ContextTypes.DEFAULT_TYPE, count: int) -> None:
+    runtime: TelegramBotRuntime = context.application.bot_data["runtime"]
+    count = max(1, min(count, 25))
+    await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+    progress = await context.bot.send_message(
+        chat_id=chat_id,
+        text="🎬 Preparing your generation batch...",
+        parse_mode=ParseMode.HTML,
+    )
+    batch_id = runtime.db.create_batch(chat_id=chat_id, kind="manual", requested_count=count, progress_message_id=progress.message_id)
+    runtime.db.update_batch(batch_id, status="active")
+    runtime._batch_text_cache.pop(batch_id, None)
+    for _ in range(count):
+        runtime.job_service.create_jobs(CreateJobRequest(), origin="manual", chat_id=chat_id, batch_id=batch_id)
+    batch = row_to_batch(runtime.db.get_batch_row(batch_id))
+    jobs = [runtime.job_service.get_job(job.id) for job in runtime.job_service.list_jobs() if job.batch_id == batch_id]
+    text = runtime._batch_progress_text(batch, jobs)
+    batch = await runtime._publish_batch_progress(context.application, batch, text)
+    runtime._batch_text_cache[batch.id] = text
+
+
+async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await ensure_allowed(update, context):
+        return
+    text = (update.effective_message.text or "").strip()
+    if context.user_data.pop("awaiting_custom_count", False):
+        if not text.isdigit():
+            await update.effective_message.reply_text("Please send a whole number like 1, 3, 5, or 10.", reply_markup=main_keyboard())
+            return
+        await create_generation_batch(update.effective_chat.id, context, int(text))
+        return
+    if text == "🎬 Generate Video":
+        await generate_video_command(update, context)
+        return
+    if text == "🔁 Video Loop":
+        await video_loop_command(update, context)
+        return
+    if text == "📚 List Videos":
+        await list_command(update, context)
+        return
+    if text == "📊 Status":
+        await status_command(update, context)
+        return
+    if text == "🛑 Stop":
+        await stop_command(update, context)
+
+
+def build_application(config: AppConfig | None = None) -> Application:
+    runtime = TelegramBotRuntime(config or load_config())
+    application = (
+        ApplicationBuilder()
+        .token(runtime.config.telegram_bot_token or "")
+        .post_init(runtime.post_init)
+        .post_shutdown(runtime.post_shutdown)
+        .build()
+    )
+    application.bot_data["runtime"] = runtime
+    application.add_handler(CommandHandler("start", start_command))
+    application.add_handler(CommandHandler("status", status_command))
+    application.add_handler(CommandHandler("generate_video", generate_video_command))
+    application.add_handler(CommandHandler("video_loop", video_loop_command))
+    application.add_handler(CommandHandler("stop", stop_command))
+    application.add_handler(CommandHandler("list", list_command))
+    application.add_handler(CallbackQueryHandler(callback_router))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
+    return application
+
+
+def main() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+    app = build_application()
+    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=False)
+
+
+if __name__ == "__main__":
+    main()

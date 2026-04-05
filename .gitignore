@@ -3,11 +3,14 @@ __pycache__/
 *.pyc
 .codex
 state/
-frontend/node_modules/
-frontend/dist/
+node_modules/
 .playwright-cli/
 backend/*.egg-info/
 backend/**/*.egg-info/
 outputs/
 *.log
 *TEMP_MPY*
+.env
+.youtube.env
+client_secret*.json
+credentials*.json
