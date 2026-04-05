@@ -534,16 +534,17 @@ async def run_upload(
             if await uploader.has_reels_dialog():
                 await uploader.dismiss_reels_dialog()
                 await uploader.current_state("AFTER_REELS_OK")
-            else:
-                await uploader.click_dialog_action("Next")
-                await uploader.current_state("AFTER_FIRST_NEXT")
-                if await uploader.has_reels_dialog():
-                    await uploader.dismiss_reels_dialog()
-                    await uploader.current_state("AFTER_REELS_OK")
 
             await uploader.select_crop_ratio("9:16")
             await uploader.current_state("AFTER_CROP_9_16")
             await uploader.assert_crop_menu_closed()
+
+            await uploader.click_dialog_action("Next")
+            await uploader.current_state("AFTER_FIRST_NEXT")
+
+            if await uploader.has_reels_dialog():
+                await uploader.dismiss_reels_dialog()
+                await uploader.current_state("AFTER_REELS_OK_POST_NEXT")
 
             await uploader.click_dialog_action("Next")
             await uploader.current_state("AFTER_SECOND_NEXT")
