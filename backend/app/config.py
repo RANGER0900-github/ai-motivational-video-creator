@@ -18,7 +18,11 @@ class AppConfig:
     quotes_csv: Path
     images_usage_json: Path
     youtube_queue_json: Path
+    instagram_queue_json: Path
     upload_js_path: Path
+    instagram_upload_script: Path
+    instagram_cookies_path: Path
+    instagram_storage_path: Path
     max_duration: float = 20.0
     fps: int = 24
     width: int = 1080
@@ -34,10 +38,11 @@ class AppConfig:
     default_chat_id: int | None = None
     telegram_parse_mode: str = "HTML"
     send_retries: int = 3
-    loop_backoff_seconds: int = 10
+    loop_backoff_seconds: int = 600
     youtube_privacy_status: str = "public"
     youtube_category_id: str = "22"
     youtube_retry_limit: int = 5
+    instagram_retry_limit: int = 3
 
     @property
     def process_log(self) -> Path:
@@ -66,16 +71,21 @@ def load_config(root_dir: Path | None = None) -> AppConfig:
         quotes_csv=root / "quotes.csv",
         images_usage_json=root / "images_usage.json",
         youtube_queue_json=state_dir / "youtube_queue.json",
+        instagram_queue_json=state_dir / "instagram_queue.json",
         upload_js_path=root / "upload.js",
+        instagram_upload_script=root / "scripts" / "ig_upload_playwright.py",
+        instagram_cookies_path=Path(os.getenv("AI_VIDEO_GEN_INSTAGRAM_COOKIES_PATH", "/home/meet/Downloads/cookies (2).txt")).resolve(),
+        instagram_storage_path=Path(os.getenv("AI_VIDEO_GEN_INSTAGRAM_STORAGE_PATH", str(state_dir / "ig_storage.json"))).resolve(),
         telegram_bot_token=os.getenv("AI_VIDEO_GEN_TELEGRAM_BOT_TOKEN"),
         allowed_chat_ids=allowed_chat_ids,
         default_chat_id=int(default_chat_id_raw) if default_chat_id_raw else (allowed_chat_ids[0] if allowed_chat_ids else None),
         telegram_parse_mode=os.getenv("AI_VIDEO_GEN_TELEGRAM_PARSE_MODE", "HTML"),
         send_retries=int(os.getenv("AI_VIDEO_GEN_SEND_RETRIES", "3")),
-        loop_backoff_seconds=int(os.getenv("AI_VIDEO_GEN_LOOP_BACKOFF_SECONDS", "10")),
+        loop_backoff_seconds=int(os.getenv("AI_VIDEO_GEN_LOOP_BACKOFF_SECONDS", "600")),
         youtube_privacy_status=os.getenv("YOUTUBE_PRIVACY_STATUS", "public"),
         youtube_category_id=os.getenv("YOUTUBE_CATEGORY_ID", "22"),
         youtube_retry_limit=int(os.getenv("AI_VIDEO_GEN_YOUTUBE_RETRY_LIMIT", "5")),
+        instagram_retry_limit=int(os.getenv("AI_VIDEO_GEN_INSTAGRAM_RETRY_LIMIT", "3")),
     )
 
 

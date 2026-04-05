@@ -4,7 +4,7 @@ import asyncio
 import html
 import logging
 from contextlib import suppress
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from telegram import (
@@ -37,6 +37,11 @@ from .database import Database, row_to_batch, row_to_bot_state, row_to_job
 from .jobs import JobContext, JobService
 from .models import CreateJobRequest, JobBatch, JobDetail
 from .storage import AssetStore
+from .instagram import (
+    InstagramQueueStore,
+    InstagramUploadError,
+    upload_to_instagram,
+)
 from .youtube import (
     DEFAULT_DESCRIPTION,
     DEFAULT_TAGS,
@@ -44,6 +49,7 @@ from .youtube import (
     YouTubeQueueStore,
     YouTubeQuotaExceeded,
     YouTubeUploadError,
+    build_description,
     rename_uploaded_file,
     upload_with_node,
 )
@@ -52,6 +58,7 @@ logger = logging.getLogger(__name__)
 
 PAGE_SIZE = 5
 COUNT_PRESETS = (1, 3, 5, 10)
+LOOP_INTERVAL_PRESETS = (600, 1200, 1800, 3600)
 ACTIVE_STATUSES = {"queued", "preparing", "rendering", "finalizing"}
 
 
@@ -76,7 +83,9 @@ class TelegramBotRuntime:
         self._batch_text_cache: dict[int, str] = {}
         self._chat_action_tasks: dict[int, tuple[str, asyncio.Task]] = {}
         self.youtube_queue = YouTubeQueueStore(config)
+        self.instagram_queue = InstagramQueueStore(config)
         self._youtube_upload_task: asyncio.Task | None = None
+        self._instagram_upload_task: asyncio.Task | None = None
 
     async def post_init(self, application: Application) -> None:
         if not self.config.telegram_bot_token:
@@ -111,6 +120,10 @@ class TelegramBotRuntime:
             self._youtube_upload_task.cancel()
             with suppress(asyncio.CancelledError):
                 await self._youtube_upload_task
+        if self._instagram_upload_task is not None:
+            self._instagram_upload_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self._instagram_upload_task
         for _, action_task in self._chat_action_tasks.values():
             action_task.cancel()
         for _, action_task in self._chat_action_tasks.values():
@@ -155,17 +168,22 @@ class TelegramBotRuntime:
         failed = [job for job in jobs if job.status == "failed"]
         state = self.bot_state()
         yt = self.youtube_queue.status_summary()
+        ig = self.instagram_queue.status_summary()
+        platforms = self._loop_platforms_text(state)
         lines = [
             "📊 <b>Generator Status</b>",
             f"🔁 Loop: <b>{'ON' if state.loop_enabled else 'OFF'}</b>",
-            f"▶️ YouTube auto-post: <b>{'ON' if state.loop_youtube_enabled else 'OFF'}</b>",
+            f"⏱️ Interval: <b>{self._format_interval(state.loop_interval_seconds)}</b>",
+            f"🌐 Platforms: <b>{platforms}</b>",
             f"🎬 In progress: <b>{len(active)}</b>",
             f"✅ Completed: <b>{len(completed)}</b>",
             f"❌ Failed: <b>{len(failed)}</b>",
             f"📺 YT pending: <b>{yt['pending']}</b> · Uploaded today: <b>{yt['estimated_uploads_today']}</b>",
+            f"📸 IG pending: <b>{ig['pending']}</b> · Uploaded: <b>{ig['uploaded']}</b>",
         ]
         if yt["quota_blocked"]:
-            lines.append("⏳ YouTube quota blocked until the next Pacific day reset")
+            until = yt["quota_blocked_until_at"] or ""
+            lines.append(f"⏳ YouTube blocked until <b>{html.escape(until)}</b>")
         if active:
             current = active[0]
             lines.extend(
@@ -187,6 +205,23 @@ class TelegramBotRuntime:
             )
         return "\n".join(lines)
 
+    def _format_interval(self, seconds: int) -> str:
+        minutes = max(1, seconds // 60)
+        if minutes % 60 == 0:
+            hours = minutes // 60
+            return f"{hours} hour{'s' if hours != 1 else ''}"
+        return f"{minutes} min"
+
+    def _loop_platforms_text(self, state) -> str:
+        platforms: list[str] = []
+        if state.loop_telegram_enabled:
+            platforms.append("Telegram")
+        if state.loop_youtube_enabled:
+            platforms.append("YouTube")
+        if state.loop_instagram_enabled:
+            platforms.append("Instagram")
+        return ", ".join(platforms) if platforms else "None"
+
     async def _background_loop(self, application: Application) -> None:
         while True:
             try:
@@ -199,6 +234,7 @@ class TelegramBotRuntime:
         await self._maintain_loop(application)
         await self._deliver_completed_jobs(application)
         await self._maybe_process_youtube_queue(application)
+        await self._maybe_process_instagram_queue(application)
         await self._refresh_batches(application)
         await self._sync_chat_actions(application)
         state = self.bot_state()
@@ -216,6 +252,17 @@ class TelegramBotRuntime:
             name=f"youtube-upload-{item['job_id']}",
         )
 
+    async def _maybe_process_instagram_queue(self, application: Application) -> None:
+        if self._instagram_upload_task is not None and not self._instagram_upload_task.done():
+            return
+        item = self.instagram_queue.next_ready_item()
+        if item is None:
+            return
+        self._instagram_upload_task = asyncio.create_task(
+            self._upload_queued_instagram(application, item["job_id"]),
+            name=f"instagram-upload-{item['job_id']}",
+        )
+
     async def _upload_queued_video(self, application: Application, job_id: int) -> None:
         try:
             item = self.youtube_queue.mark_uploading(job_id)
@@ -229,7 +276,7 @@ class TelegramBotRuntime:
                 self.config,
                 video_path=output_path,
                 title=item["title"],
-                description=DEFAULT_DESCRIPTION,
+                description=build_description(str(item.get("quote") or ""), str(item.get("author") or "")),
                 tags=list(DEFAULT_TAGS),
                 privacy_status=item.get("privacy_status", self.config.youtube_privacy_status),
                 category_id=item.get("category_id", self.config.youtube_category_id),
@@ -250,15 +297,16 @@ class TelegramBotRuntime:
                     reply_to_message_id=job.telegram_message_id,
                 )
         except YouTubeQuotaExceeded as exc:
+            before = self.youtube_queue.get_item(job_id)
             item = self.youtube_queue.mark_failed(job_id, str(exc), quota_exceeded=True)
             chat_id = item.get("chat_id")
-            if chat_id:
+            if chat_id and (before or {}).get("youtube_status") != "quota_blocked":
                 summary = self.youtube_queue.status_summary()
                 await application.bot.send_message(
                     chat_id=chat_id,
                     text=(
-                        "⚠️ <b>YouTube quota is over for today</b>\n"
-                        f"Saved for tomorrow: <b>{summary['pending']}</b> pending upload(s)."
+                        "⚠️ <b>YouTube uploads are blocked for 24 hours</b>\n"
+                        f"Saved for later: <b>{summary['pending']}</b> pending upload(s)."
                     ),
                     parse_mode=ParseMode.HTML,
                 )
@@ -277,6 +325,53 @@ class TelegramBotRuntime:
                 )
         finally:
             self._youtube_upload_task = None
+
+    async def _upload_queued_instagram(self, application: Application, job_id: int) -> None:
+        try:
+            item = self.instagram_queue.mark_uploading(job_id)
+            job = self.job_service.get_job(job_id)
+            if not job.output_path:
+                raise FileNotFoundError(f"Job #{job_id} has no output_path")
+            output_path = self.config.root_dir / job.output_path
+            if not output_path.exists():
+                raise FileNotFoundError(f"Output file missing for job #{job_id}: {output_path}")
+            result = await upload_to_instagram(
+                self.config,
+                video_path=output_path,
+                caption=str(item.get("caption") or ""),
+            )
+            queue_item = self.instagram_queue.mark_uploaded(job.id, result=result)
+            if job.chat_id is not None:
+                await application.bot.send_message(
+                    chat_id=job.chat_id,
+                    text=self._instagram_success_text(queue_item),
+                    parse_mode=ParseMode.HTML,
+                    reply_to_message_id=job.telegram_message_id,
+                )
+        except Exception as exc:
+            auth_blocked = "not authenticated on this server" in str(exc).lower()
+            item = self.instagram_queue.mark_failed(job_id, str(exc), auth_blocked=auth_blocked)
+            chat_id = item.get("chat_id")
+            if chat_id:
+                await application.bot.send_message(
+                    chat_id=chat_id,
+                    text=(
+                        (
+                            "⏳ <b>Instagram session is not authenticated on the VPS</b>\n"
+                            "Refresh the VPS Instagram cookies or storage before retrying uploads.\n"
+                        )
+                        if auth_blocked
+                        else (
+                            "⚠️ <b>Instagram upload failed</b>\n"
+                            f"Job #{job_id} is still queued for retry.\n"
+                        )
+                    )
+                    + f"<code>{html.escape(str(exc)[:300])}</code>",
+                    parse_mode=ParseMode.HTML,
+                    reply_to_message_id=item.get("telegram_message_id"),
+                )
+        finally:
+            self._instagram_upload_task = None
 
     def _youtube_success_text(self, item: dict[str, object]) -> str:
         title = html.escape(str(item.get("title", "")))
@@ -305,14 +400,42 @@ class TelegramBotRuntime:
             return f"⚠️ <b>YouTube upload will retry</b>\n<code>{detail[:300]}</code>"
         return "📺 <b>Added to YouTube queue</b>\nYour video will upload automatically."
 
-    def _youtube_upload_markup(self, job: JobDetail) -> InlineKeyboardMarkup | None:
+    def _instagram_success_text(self, item: dict[str, object]) -> str:
+        url = html.escape(str(item.get("instagram_url", "")))
+        return "\n".join(
+            [
+                "📸 <b>Uploaded to Instagram</b>",
+                "",
+                "🔗 <b>Instagram URL:</b>",
+                url,
+            ]
+        )
+
+    def _instagram_queue_text(self, item: dict[str, object]) -> str:
+        status = str(item.get("instagram_status", "pending"))
+        if status == "uploaded":
+            return self._instagram_success_text(item)
+        if status == "uploading":
+            return "📸 <b>Instagram upload in progress</b>\nYour reel is being published now."
+        if status == "auth_blocked":
+            return "⏳ <b>Instagram is blocked on this VPS</b>\nRefresh the VPS Instagram session before retrying uploads."
+        if status == "failed":
+            detail = html.escape(str(item.get("last_error", "Previous upload failed")))
+            return f"⚠️ <b>Instagram upload will retry</b>\n<code>{detail[:300]}</code>"
+        return "📸 <b>Added to Instagram queue</b>\nYour reel will upload automatically."
+
+    def _publish_upload_markup(self, job: JobDetail) -> InlineKeyboardMarkup | None:
         if job.status != "completed" or not job.output_path:
             return None
-        if job.origin == "loop" and self.bot_state().loop_youtube_enabled:
+        state = self.bot_state()
+        buttons: list[InlineKeyboardButton] = []
+        if not (job.origin == "loop" and state.loop_youtube_enabled):
+            buttons.append(InlineKeyboardButton("📺 Upload to YouTube", callback_data=f"ytup:{job.id}"))
+        if not (job.origin == "loop" and state.loop_instagram_enabled):
+            buttons.append(InlineKeyboardButton("📸 Upload to Instagram", callback_data=f"igup:{job.id}"))
+        if not buttons:
             return None
-        return InlineKeyboardMarkup(
-            [[InlineKeyboardButton("📺 Upload to YouTube", callback_data=f"ytup:{job.id}")]]
-        )
+        return InlineKeyboardMarkup([buttons])
 
     async def _sync_chat_actions(self, application: Application) -> None:
         desired: dict[int, str] = {}
@@ -326,6 +449,12 @@ class TelegramBotRuntime:
         for job in self.job_service.list_delivery_pending_jobs():
             if job.chat_id is not None:
                 desired[job.chat_id] = ChatAction.UPLOAD_VIDEO
+        for item in self.youtube_queue.snapshot().get("items", []):
+            if str(item.get("youtube_status")) == "uploading" and item.get("chat_id") is not None:
+                desired[int(item["chat_id"])] = ChatAction.UPLOAD_VIDEO
+        for item in self.instagram_queue.load().get("items", []):
+            if str(item.get("instagram_status")) == "uploading" and item.get("chat_id") is not None:
+                desired[int(item["chat_id"])] = ChatAction.UPLOAD_VIDEO
 
         active_chat_ids = set(self._chat_action_tasks)
         desired_chat_ids = set(desired)
@@ -360,16 +489,48 @@ class TelegramBotRuntime:
             return
         if self.db.count_active_jobs_by_origin("loop") > 0:
             return
+        if self._loop_publications_pending():
+            return
         recent = self.recent_loop_job()
-        if recent and recent.status == "failed" and recent.completed_at is not None:
-            elapsed = (datetime.now(timezone.utc) - recent.completed_at).total_seconds()
-            if elapsed < self.config.loop_backoff_seconds:
+        if recent:
+            reference_time = recent.delivered_at or recent.completed_at or recent.updated_at or recent.created_at
+            elapsed = (datetime.now(timezone.utc) - reference_time).total_seconds()
+            if elapsed < state.loop_interval_seconds:
                 return
         self.job_service.create_jobs(CreateJobRequest(), origin="loop", chat_id=state.loop_chat_id)
+
+    def _loop_publications_pending(self) -> bool:
+        loop_job_ids = {job.id for job in self.job_service.list_jobs() if job.origin == "loop"}
+        if not loop_job_ids:
+            return False
+        for item in self.youtube_queue.snapshot().get("items", []):
+            if int(item.get("job_id", 0)) in loop_job_ids and str(item.get("youtube_status")) == "uploading":
+                return True
+        for item in self.instagram_queue.load().get("items", []):
+            if int(item.get("job_id", 0)) in loop_job_ids and str(item.get("instagram_status")) == "uploading":
+                return True
+        return False
 
     async def _deliver_completed_jobs(self, application: Application) -> None:
         pending = self.job_service.list_delivery_pending_jobs()
         for job in pending:
+            state = self.bot_state()
+            if job.origin == "loop" and not state.loop_telegram_enabled:
+                self.db.update_job(
+                    job.id,
+                    status=job.status,
+                    progress=job.progress,
+                    phase=job.phase,
+                    message=job.message,
+                    delivery_status="skipped",
+                    delivery_message="Telegram delivery disabled for loop mode",
+                )
+                refreshed = self.job_service.get_job(job.id)
+                if state.loop_youtube_enabled:
+                    self.youtube_queue.enqueue_loop_job(refreshed)
+                if state.loop_instagram_enabled:
+                    self.instagram_queue.enqueue_job(refreshed, instagram_enabled_for_origin=True)
+                continue
             if job.chat_id is None:
                 self.db.update_job(
                     job.id,
@@ -396,8 +557,11 @@ class TelegramBotRuntime:
                 continue
             try:
                 await self.send_single_video(application, job, chat_id=job.chat_id, mark_delivery=True)
-                if job.origin == "loop" and self.bot_state().loop_youtube_enabled:
-                    self.youtube_queue.enqueue_loop_job(self.job_service.get_job(job.id))
+                refreshed = self.job_service.get_job(job.id)
+                if job.origin == "loop" and state.loop_youtube_enabled:
+                    self.youtube_queue.enqueue_loop_job(refreshed)
+                if job.origin == "loop" and state.loop_instagram_enabled:
+                    self.instagram_queue.enqueue_job(refreshed, instagram_enabled_for_origin=True)
             except Exception as exc:
                 logger.exception("Failed to deliver job %s", job.id)
                 self.db.update_job(
@@ -510,7 +674,7 @@ class TelegramBotRuntime:
                 caption=caption,
                 parse_mode=ParseMode.HTML,
                 supports_streaming=True,
-                reply_markup=self._youtube_upload_markup(job),
+                reply_markup=self._publish_upload_markup(job),
             )
         else:
             with output_path.open("rb") as handle:
@@ -520,7 +684,7 @@ class TelegramBotRuntime:
                     caption=caption,
                     parse_mode=ParseMode.HTML,
                     supports_streaming=True,
-                    reply_markup=self._youtube_upload_markup(job),
+                    reply_markup=self._publish_upload_markup(job),
                 )
         telegram_file_id = message.video.file_id if message.video else None
         if mark_delivery:
@@ -605,6 +769,40 @@ def main_keyboard() -> ReplyKeyboardMarkup:
     )
 
 
+def loop_interval_keyboard(selected_seconds: int | None = None) -> InlineKeyboardMarkup:
+    rows = []
+    row = []
+    for seconds in LOOP_INTERVAL_PRESETS:
+        minutes = seconds // 60
+        label = f"{minutes} min"
+        if selected_seconds == seconds:
+            label = f"✅ {label}"
+        row.append(InlineKeyboardButton(label, callback_data=f"loopint:{seconds}"))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    return InlineKeyboardMarkup(rows)
+
+
+def loop_platform_keyboard(selected: set[str], interval_seconds: int) -> InlineKeyboardMarkup:
+    def label(name: str, emoji: str) -> str:
+        return f"{'✅' if name in selected else '▫️'} {emoji} {name.title()}"
+
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton(f"⏱️ {interval_seconds // 60} min", callback_data="loopcfg:interval")],
+            [
+                InlineKeyboardButton(label("telegram", "💬"), callback_data="loopplat:telegram"),
+                InlineKeyboardButton(label("youtube", "📺"), callback_data="loopplat:youtube"),
+                InlineKeyboardButton(label("instagram", "📸"), callback_data="loopplat:instagram"),
+            ],
+            [InlineKeyboardButton("✅ Start Loop", callback_data="loopconfirm:start")],
+        ]
+    )
+
+
 async def ensure_allowed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     runtime: TelegramBotRuntime = context.application.bot_data["runtime"]
     chat_id = update.effective_chat.id if update.effective_chat else None
@@ -660,19 +858,22 @@ async def video_loop_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     chat_id = update.effective_chat.id
     state = runtime.bot_state()
     if state.loop_enabled and state.loop_chat_id == chat_id:
-        mode = "Telegram + YouTube" if state.loop_youtube_enabled else "Telegram only"
-        await update.effective_message.reply_text(f"🔁 Loop mode is already running.\nMode: <b>{mode}</b>", parse_mode=ParseMode.HTML, reply_markup=main_keyboard())
+        await update.effective_message.reply_text(
+            (
+                "🔁 Loop mode is already running.\n"
+                f"Platforms: <b>{runtime._loop_platforms_text(state)}</b>\n"
+                f"Interval: <b>{runtime._format_interval(state.loop_interval_seconds)}</b>"
+            ),
+            parse_mode=ParseMode.HTML,
+            reply_markup=main_keyboard(),
+        )
         return
-    markup = InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton("📺 Yes, Telegram + YouTube", callback_data="loopyt:on")],
-            [InlineKeyboardButton("💬 No, Telegram only", callback_data="loopyt:off")],
-        ]
-    )
+    context.user_data["loop_interval_seconds"] = state.loop_interval_seconds or LOOP_INTERVAL_PRESETS[0]
+    context.user_data["loop_platforms"] = {"telegram"}
     await update.effective_message.reply_text(
-        "🔁 <b>Want your generated videos to auto post on YouTube too?</b>",
+        "🔁 <b>Select your loop interval</b>",
         parse_mode=ParseMode.HTML,
-        reply_markup=markup,
+        reply_markup=loop_interval_keyboard(context.user_data["loop_interval_seconds"]),
     )
 
 
@@ -680,7 +881,13 @@ async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if not await ensure_allowed(update, context):
         return
     runtime: TelegramBotRuntime = context.application.bot_data["runtime"]
-    runtime.db.update_bot_state(loop_enabled=False, loop_youtube_enabled=False, stop_requested=True)
+    runtime.db.update_bot_state(
+        loop_enabled=False,
+        loop_youtube_enabled=False,
+        loop_instagram_enabled=False,
+        loop_telegram_enabled=False,
+        stop_requested=True,
+    )
     loop_jobs = [job for job in runtime.active_loop_jobs()]
     for job in loop_jobs:
         runtime.job_service.cancel_job(job.id)
@@ -744,6 +951,49 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     runtime: TelegramBotRuntime = context.application.bot_data["runtime"]
     query = update.callback_query
     data = query.data or ""
+    if data.startswith("igup:"):
+        job_id = int(data.split(":", 1)[1])
+        job = runtime.job_service.get_job(job_id)
+        if job.status != "completed" or not job.output_path:
+            await query.answer("This video is not ready for Instagram upload yet.", show_alert=True)
+            return
+        item = runtime.instagram_queue.get_item(job_id)
+        if item is None or str(item.get("instagram_status")) == "failed":
+            item = runtime.instagram_queue.enqueue_job(runtime.job_service.get_job(job_id), instagram_enabled_for_origin=False)
+        await runtime._maybe_process_instagram_queue(context.application)
+        status = str(item.get("instagram_status", "pending"))
+        if status == "uploaded":
+            await query.answer()
+            await query.message.reply_text(
+                runtime._instagram_success_text(item),
+                parse_mode=ParseMode.HTML,
+                reply_markup=main_keyboard(),
+                reply_to_message_id=job.telegram_message_id,
+            )
+            return
+        if status == "failed":
+            await query.answer()
+            await query.message.reply_text(
+                runtime._instagram_queue_text(item),
+                parse_mode=ParseMode.HTML,
+                reply_markup=main_keyboard(),
+                reply_to_message_id=job.telegram_message_id,
+            )
+            return
+        if status == "auth_blocked":
+            await query.answer()
+            await query.message.reply_text(
+                runtime._instagram_queue_text(item),
+                parse_mode=ParseMode.HTML,
+                reply_markup=main_keyboard(),
+                reply_to_message_id=job.telegram_message_id,
+            )
+            return
+        if status == "uploading":
+            await query.answer("Instagram upload is already in progress.")
+            return
+        await query.answer("Instagram upload queued.")
+        return
     if data.startswith("ytup:"):
         job_id = int(data.split(":", 1)[1])
         job = runtime.job_service.get_job(job_id)
@@ -800,18 +1050,61 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             return
         await create_generation_batch(update.effective_chat.id, context, int(token))
         return
-    if data.startswith("loopyt:"):
-        enabled = data.split(":", 1)[1] == "on"
+    if data.startswith("loopint:"):
+        seconds = int(data.split(":", 1)[1])
+        context.user_data["loop_interval_seconds"] = seconds
+        platforms = set(context.user_data.get("loop_platforms", {"telegram"}))
+        await query.message.edit_text(
+            "🌐 <b>Select where each loop video should go</b>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=loop_platform_keyboard(platforms, seconds),
+        )
+        return
+    if data == "loopcfg:interval":
+        seconds = int(context.user_data.get("loop_interval_seconds", LOOP_INTERVAL_PRESETS[0]))
+        await query.message.edit_text(
+            "🔁 <b>Select your loop interval</b>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=loop_interval_keyboard(seconds),
+        )
+        return
+    if data.startswith("loopplat:"):
+        platform = data.split(":", 1)[1]
+        selected = set(context.user_data.get("loop_platforms", {"telegram"}))
+        if platform in selected:
+            selected.remove(platform)
+        else:
+            selected.add(platform)
+        if not selected:
+            selected = {"telegram"}
+        context.user_data["loop_platforms"] = selected
+        seconds = int(context.user_data.get("loop_interval_seconds", LOOP_INTERVAL_PRESETS[0]))
+        await query.message.edit_text(
+            "🌐 <b>Select where each loop video should go</b>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=loop_platform_keyboard(selected, seconds),
+        )
+        return
+    if data == "loopconfirm:start":
+        platforms = set(context.user_data.get("loop_platforms", {"telegram"}))
+        seconds = int(context.user_data.get("loop_interval_seconds", LOOP_INTERVAL_PRESETS[0]))
         runtime.db.update_bot_state(
             loop_enabled=True,
             loop_chat_id=update.effective_chat.id,
-            loop_youtube_enabled=enabled,
+            loop_youtube_enabled="youtube" in platforms,
+            loop_instagram_enabled="instagram" in platforms,
+            loop_telegram_enabled="telegram" in platforms,
+            loop_interval_seconds=seconds,
             loop_started_at=utcnow_iso(),
             stop_requested=False,
         )
-        mode = "Telegram + YouTube" if enabled else "Telegram only"
         await query.message.reply_text(
-            f"🔁 <b>Video loop enabled</b>\nMode: <b>{mode}</b>\nI’ll keep generating videos until you send /stop.",
+            (
+                "🔁 <b>Video loop enabled</b>\n"
+                f"Platforms: <b>{', '.join(name.title() for name in sorted(platforms))}</b>\n"
+                f"Interval: <b>{runtime._format_interval(seconds)}</b>\n"
+                "I’ll keep generating until you send /stop."
+            ),
             parse_mode=ParseMode.HTML,
             reply_markup=main_keyboard(),
         )

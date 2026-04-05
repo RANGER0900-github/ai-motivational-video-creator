@@ -6,17 +6,13 @@ import logging
 import threading
 from copy import deepcopy
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
-from zoneinfo import ZoneInfo
-
 from .config import AppConfig
 from .models import JobDetail
 
 logger = logging.getLogger(__name__)
-
-PACIFIC = ZoneInfo("America/Los_Angeles")
 DEFAULT_QUOTA_LIMIT = 10_000
 DEFAULT_UPLOAD_COST = 1_600
 DESCRIPTION_VERSION = "v2"
@@ -88,12 +84,14 @@ def utcnow_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def pacific_day_key(now: datetime | None = None) -> str:
-    current = now or datetime.now(timezone.utc)
-    return current.astimezone(PACIFIC).date().isoformat()
-
-
-def pick_title(job_id: int, items: list[dict[str, Any]]) -> str:
+def pick_title(job_id: int, items: list[dict[str, Any]], quote: str = "") -> str:
+    quote_text = quote.strip().strip('"')
+    if quote_text:
+        for suffix in (" #Shorts", " #Shorts #motivation", " #Shorts #discipline"):
+            limit = 100 - len(suffix)
+            clipped = quote_text[:limit].rstrip(" .,!?:;\"'")
+            if clipped:
+                return f"{clipped}{suffix}"
     used = [item.get("title", "") for item in items if item.get("youtube_status") == "uploaded"]
     start = job_id % len(TITLE_POOL)
     for offset in range(len(TITLE_POOL)):
@@ -101,6 +99,18 @@ def pick_title(job_id: int, items: list[dict[str, Any]]) -> str:
         if not used or candidate != used[-1]:
             return candidate
     return TITLE_POOL[start]
+
+
+def build_description(quote: str = "", author: str = "") -> str:
+    quote_text = quote.strip()
+    author_text = author.strip()
+    if not quote_text:
+        return DEFAULT_DESCRIPTION
+    intro_lines = [quote_text]
+    if author_text:
+        intro_lines.append(f"— {author_text}")
+    intro_lines.append("")
+    return "\n".join(intro_lines) + DEFAULT_DESCRIPTION
 
 
 @dataclass(slots=True)
@@ -125,10 +135,11 @@ class YouTubeQueueStore:
             "quota": {
                 "daily_limit_units": DEFAULT_QUOTA_LIMIT,
                 "upload_cost_units": DEFAULT_UPLOAD_COST,
-                "current_day": pacific_day_key(),
                 "estimated_uploads_today": 0,
                 "estimated_quota_units_used_today": 0,
-                "quota_blocked_until_day": None,
+                "quota_window_started_at": None,
+                "quota_blocked_until_at": None,
+                "quota_notice_sent_at": None,
                 "last_quota_exhausted_at": None,
             },
             "items": [],
@@ -137,7 +148,7 @@ class YouTubeQueueStore:
     def load(self) -> dict[str, Any]:
         with self._lock:
             data = self._load_unlocked()
-            return self._rollover_if_needed(data, persist=True)
+            return self._refresh_quota_window(data, persist=True)
 
     def _load_unlocked(self) -> dict[str, Any]:
         if not self.path.exists():
@@ -151,21 +162,33 @@ class YouTubeQueueStore:
         temp_path.write_text(json.dumps(data, indent=2, ensure_ascii=True), encoding="utf-8")
         temp_path.replace(self.path)
 
-    def _rollover_if_needed(self, data: dict[str, Any], persist: bool) -> dict[str, Any]:
+    def _refresh_quota_window(self, data: dict[str, Any], persist: bool) -> dict[str, Any]:
         changed = False
         quota = data.setdefault("quota", {})
-        today = pacific_day_key()
-        current_day = quota.get("current_day")
-        if current_day != today:
-            quota["current_day"] = today
-            quota["estimated_uploads_today"] = 0
-            quota["estimated_quota_units_used_today"] = 0
-            quota["quota_blocked_until_day"] = None
+        now = datetime.now(timezone.utc)
+        window_started_at = quota.get("quota_window_started_at")
+        if window_started_at is None:
+            quota["quota_window_started_at"] = now.isoformat()
+            changed = True
+        else:
+            started = datetime.fromisoformat(window_started_at)
+            if (now - started).total_seconds() >= 86400:
+                quota["quota_window_started_at"] = now.isoformat()
+                quota["estimated_uploads_today"] = 0
+                quota["estimated_quota_units_used_today"] = 0
+                changed = True
+        blocked_until_at = quota.get("quota_blocked_until_at")
+        if blocked_until_at is not None:
+            blocked_until = datetime.fromisoformat(blocked_until_at)
+            if now >= blocked_until:
+                quota["quota_blocked_until_at"] = None
+                quota["quota_notice_sent_at"] = None
+                changed = True
+        if quota.get("quota_blocked_until_at") is None:
             for item in data.setdefault("items", []):
                 if item.get("youtube_status") == "quota_blocked":
                     item["youtube_status"] = "pending"
-                    item["last_error"] = "Retrying after daily quota reset"
-            changed = True
+                    item["last_error"] = "Retrying after 24h upload block expired"
         if changed and persist:
             self._write(data)
         return data
@@ -180,14 +203,15 @@ class YouTubeQueueStore:
             "pending": sum(1 for item in items if item.get("youtube_status") in {"pending", "uploading", "quota_blocked"}),
             "uploaded": sum(1 for item in items if item.get("youtube_status") == "uploaded"),
             "failed": sum(1 for item in items if item.get("youtube_status") == "failed"),
-            "quota_blocked": bool(data["quota"].get("quota_blocked_until_day")),
+            "quota_blocked": bool(data["quota"].get("quota_blocked_until_at")),
+            "quota_blocked_until_at": data["quota"].get("quota_blocked_until_at"),
             "estimated_uploads_today": int(data["quota"].get("estimated_uploads_today", 0)),
             "estimated_quota_units_used_today": int(data["quota"].get("estimated_quota_units_used_today", 0)),
         }
 
     def enqueue_job(self, job: JobDetail, *, youtube_enabled_for_origin: bool) -> dict[str, Any]:
         with self._lock:
-            data = self._rollover_if_needed(self._load_unlocked(), persist=False)
+            data = self._refresh_quota_window(self._load_unlocked(), persist=False)
             items = data["items"]
             existing = next((item for item in items if item.get("job_id") == job.id), None)
             if existing:
@@ -214,7 +238,7 @@ class YouTubeQueueStore:
                 "youtube_shorts_url": None,
                 "quote": job.quote,
                 "author": job.author,
-                "title": pick_title(job.id, items),
+                "title": pick_title(job.id, items, job.quote),
                 "description_version": DESCRIPTION_VERSION,
                 "tags": list(DEFAULT_TAGS),
                 "privacy_status": self.config.youtube_privacy_status,
@@ -222,7 +246,6 @@ class YouTubeQueueStore:
                 "attempt_count": 0,
                 "last_attempt_at": None,
                 "last_error": None,
-                "quota_day": data["quota"]["current_day"],
                 "quota_cost": DEFAULT_UPLOAD_COST,
                 "renamed_yt_done": False,
             }
@@ -242,8 +265,8 @@ class YouTubeQueueStore:
 
     def next_ready_item(self) -> dict[str, Any] | None:
         data = self.load()
-        quota_day = data["quota"].get("quota_blocked_until_day")
-        if quota_day:
+        blocked_until_at = data["quota"].get("quota_blocked_until_at")
+        if blocked_until_at:
             return None
         for item in data["items"]:
             if item.get("youtube_status") in {"pending", "failed"} and int(item.get("attempt_count", 0)) < self.config.youtube_retry_limit:
@@ -252,7 +275,7 @@ class YouTubeQueueStore:
 
     def mark_uploading(self, job_id: int) -> dict[str, Any]:
         with self._lock:
-            data = self._rollover_if_needed(self._load_unlocked(), persist=False)
+            data = self._refresh_quota_window(self._load_unlocked(), persist=False)
             item = self._item_by_job_id(data, job_id)
             item["youtube_status"] = "uploading"
             item["attempt_count"] = int(item.get("attempt_count", 0)) + 1
@@ -262,7 +285,7 @@ class YouTubeQueueStore:
 
     def mark_uploaded(self, job_id: int, *, result: UploadResult, new_output_path: str, renamed_yt_done: bool) -> dict[str, Any]:
         with self._lock:
-            data = self._rollover_if_needed(self._load_unlocked(), persist=False)
+            data = self._refresh_quota_window(self._load_unlocked(), persist=False)
             item = self._item_by_job_id(data, job_id)
             item["youtube_status"] = "uploaded"
             item["youtube_video_id"] = result.video_id
@@ -280,13 +303,16 @@ class YouTubeQueueStore:
 
     def mark_failed(self, job_id: int, error: str, *, quota_exceeded: bool = False) -> dict[str, Any]:
         with self._lock:
-            data = self._rollover_if_needed(self._load_unlocked(), persist=False)
+            data = self._refresh_quota_window(self._load_unlocked(), persist=False)
             item = self._item_by_job_id(data, job_id)
             item["youtube_status"] = "quota_blocked" if quota_exceeded else "failed"
             item["last_error"] = error[:500]
             if quota_exceeded:
-                data["quota"]["quota_blocked_until_day"] = data["quota"]["current_day"]
-                data["quota"]["last_quota_exhausted_at"] = utcnow_iso()
+                exhausted_at = datetime.now(timezone.utc)
+                data["quota"]["quota_blocked_until_at"] = (exhausted_at + timedelta(hours=24)).isoformat()
+                data["quota"]["last_quota_exhausted_at"] = exhausted_at.isoformat()
+                if not data["quota"].get("quota_notice_sent_at"):
+                    data["quota"]["quota_notice_sent_at"] = exhausted_at.isoformat()
             self._write(data)
             return deepcopy(item)
 
@@ -333,7 +359,14 @@ async def upload_with_node(config: AppConfig, *, video_path: Path, title: str, d
     if process.returncode != 0:
         message = (payload or {}).get("message") or error_output or output or f"node upload failed with code {process.returncode}"
         reason = (payload or {}).get("reason", "")
-        if "quota" in message.lower() or "quota" in reason.lower():
+        lower_message = message.lower()
+        lower_reason = reason.lower()
+        if (
+            "quota" in lower_message
+            or "quota" in lower_reason
+            or "exceeded the number of videos they may upload" in lower_message
+            or "exceeded the number of videos they may upload" in lower_reason
+        ):
             raise YouTubeQuotaExceeded(message)
         raise YouTubeUploadError(message)
     if not payload or not payload.get("ok"):

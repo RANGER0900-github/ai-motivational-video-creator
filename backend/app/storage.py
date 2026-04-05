@@ -87,7 +87,21 @@ class AssetStore:
                 return str(path)
         return None
 
+    def _preferred_project_font(self, candidates: list[str]) -> str | None:
+        for candidate in candidates:
+            path = self.config.fonts_dir / candidate
+            if path.exists():
+                return str(path)
+        return None
+
     def default_quote_font(self) -> str | None:
+        bundled = self._preferred_project_font([
+            "NotoSans-Bold.ttf",
+            "NotoSans-Regular.ttf",
+            "PlayfairDisplay-VariableFont_wght.ttf",
+        ])
+        if bundled:
+            return bundled
         preferred = self._preferred_system_font([
             "/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf",
             "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
@@ -100,6 +114,13 @@ class AssetStore:
         return str(self.config.root_dir / fonts[0].path)
 
     def default_author_font(self) -> str | None:
+        bundled = self._preferred_project_font([
+            "NotoSans-Regular.ttf",
+            "NotoSans-Bold.ttf",
+            "PlayfairDisplay-VariableFont_wght.ttf",
+        ])
+        if bundled:
+            return bundled
         preferred = self._preferred_system_font([
             "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
             "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",

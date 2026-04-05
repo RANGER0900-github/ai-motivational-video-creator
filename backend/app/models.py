@@ -93,6 +93,9 @@ class BotState(BaseModel):
     loop_enabled: bool = False
     loop_chat_id: int | None = None
     loop_youtube_enabled: bool = False
+    loop_instagram_enabled: bool = False
+    loop_telegram_enabled: bool = True
+    loop_interval_seconds: int = 600
     loop_started_at: datetime | None = None
     stop_requested: bool = False
     last_startup_at: datetime | None = None

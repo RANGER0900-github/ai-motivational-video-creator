@@ -25,4 +25,5 @@ fi
 
 export PYTHONUNBUFFERED=1
 export PYTHONPATH="${ROOT_DIR}/backend${PYTHONPATH:+:$PYTHONPATH}"
+export PLAYWRIGHT_BROWSERS_PATH="${PLAYWRIGHT_BROWSERS_PATH:-$ROOT_DIR/.playwright-cli}"
 exec python -m app.telegram_bot

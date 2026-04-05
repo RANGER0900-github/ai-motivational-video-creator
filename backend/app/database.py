@@ -43,6 +43,9 @@ CREATE TABLE IF NOT EXISTS bot_state (
   loop_enabled INTEGER NOT NULL DEFAULT 0,
   loop_chat_id INTEGER,
   loop_youtube_enabled INTEGER NOT NULL DEFAULT 0,
+  loop_instagram_enabled INTEGER NOT NULL DEFAULT 0,
+  loop_telegram_enabled INTEGER NOT NULL DEFAULT 1,
+  loop_interval_seconds INTEGER NOT NULL DEFAULT 600,
   loop_started_at TEXT,
   stop_requested INTEGER NOT NULL DEFAULT 0,
   last_startup_at TEXT
@@ -83,6 +86,9 @@ JOB_EXTRA_COLUMNS: dict[str, str] = {
 
 BOT_STATE_EXTRA_COLUMNS: dict[str, str] = {
     "loop_youtube_enabled": "INTEGER NOT NULL DEFAULT 0",
+    "loop_instagram_enabled": "INTEGER NOT NULL DEFAULT 0",
+    "loop_telegram_enabled": "INTEGER NOT NULL DEFAULT 1",
+    "loop_interval_seconds": "INTEGER NOT NULL DEFAULT 600",
 }
 
 
@@ -280,7 +286,7 @@ class Database:
             raise KeyError("bot_state")
         return row
 
-    def update_bot_state(self, *, loop_enabled: bool | None = None, loop_chat_id: int | None = None, loop_youtube_enabled: bool | None = None, loop_started_at: str | None = None, stop_requested: bool | None = None, last_startup_at: str | None = None) -> None:
+    def update_bot_state(self, *, loop_enabled: bool | None = None, loop_chat_id: int | None = None, loop_youtube_enabled: bool | None = None, loop_instagram_enabled: bool | None = None, loop_telegram_enabled: bool | None = None, loop_interval_seconds: int | None = None, loop_started_at: str | None = None, stop_requested: bool | None = None, last_startup_at: str | None = None) -> None:
         with self.connect() as conn:
             current = conn.execute("SELECT * FROM bot_state WHERE id = 1").fetchone()
             if current is None:
@@ -289,13 +295,16 @@ class Database:
             conn.execute(
                 """
                 UPDATE bot_state
-                SET loop_enabled = ?, loop_chat_id = ?, loop_youtube_enabled = ?, loop_started_at = ?, stop_requested = ?, last_startup_at = ?
+                SET loop_enabled = ?, loop_chat_id = ?, loop_youtube_enabled = ?, loop_instagram_enabled = ?, loop_telegram_enabled = ?, loop_interval_seconds = ?, loop_started_at = ?, stop_requested = ?, last_startup_at = ?
                 WHERE id = 1
                 """,
                 (
                     int(loop_enabled if loop_enabled is not None else current["loop_enabled"]),
                     loop_chat_id if loop_chat_id is not None else current["loop_chat_id"],
                     int(loop_youtube_enabled if loop_youtube_enabled is not None else current["loop_youtube_enabled"]),
+                    int(loop_instagram_enabled if loop_instagram_enabled is not None else current["loop_instagram_enabled"]),
+                    int(loop_telegram_enabled if loop_telegram_enabled is not None else current["loop_telegram_enabled"]),
+                    int(loop_interval_seconds if loop_interval_seconds is not None else current["loop_interval_seconds"]),
                     loop_started_at if loop_started_at is not None else current["loop_started_at"],
                     int(stop_requested if stop_requested is not None else current["stop_requested"]),
                     last_startup_at if last_startup_at is not None else current["last_startup_at"],
@@ -386,6 +395,9 @@ def row_to_bot_state(row) -> BotState:
         loop_enabled=bool(row["loop_enabled"]),
         loop_chat_id=int(row["loop_chat_id"]) if row["loop_chat_id"] is not None else None,
         loop_youtube_enabled=bool(row["loop_youtube_enabled"]) if row["loop_youtube_enabled"] is not None else False,
+        loop_instagram_enabled=bool(row["loop_instagram_enabled"]) if row["loop_instagram_enabled"] is not None else False,
+        loop_telegram_enabled=bool(row["loop_telegram_enabled"]) if row["loop_telegram_enabled"] is not None else True,
+        loop_interval_seconds=int(row["loop_interval_seconds"]) if row["loop_interval_seconds"] is not None else 600,
         loop_started_at=datetime.fromisoformat(row["loop_started_at"]) if row["loop_started_at"] else None,
         stop_requested=bool(row["stop_requested"]),
         last_startup_at=datetime.fromisoformat(row["last_startup_at"]) if row["last_startup_at"] else None,
