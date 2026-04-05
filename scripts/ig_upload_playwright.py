@@ -1,7 +1,9 @@
 import asyncio
+import shutil
 import json
 import os
 import sqlite3
+import tempfile
 from pathlib import Path
 
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
@@ -58,6 +60,28 @@ def env_flag(name: str, default: bool = False) -> bool:
     if value is None:
         return default
     return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def copy_user_data_tree(source_root: Path, profile_name: str) -> Path:
+    if not source_root.exists():
+        raise SystemExit(f"Missing Instagram profile root: {source_root}")
+    profile_source = source_root / profile_name
+    if not profile_source.exists():
+        raise SystemExit(f"Missing Instagram profile {profile_name!r} under {source_root}")
+    temp_root = Path(tempfile.mkdtemp(prefix="ig-profile-"))
+    local_state = source_root / "Local State"
+    if local_state.exists():
+        shutil.copy2(local_state, temp_root / "Local State")
+    profile_copy = temp_root / profile_name
+    shutil.copytree(profile_source, profile_copy)
+    for pattern in ("Singleton*", "lockfile", "LOCK", "lock"):
+        for path in temp_root.glob(pattern):
+            if path.is_file() or path.is_symlink():
+                path.unlink(missing_ok=True)
+        for path in profile_copy.glob(pattern):
+            if path.is_file() or path.is_symlink():
+                path.unlink(missing_ok=True)
+    return temp_root
 
 
 def lookup_job_metadata(video_path: Path, db_path: Path) -> dict[str, str | int | None]:
@@ -355,27 +379,45 @@ async def run_upload(
     caption: str,
     cookies_path: Path,
     storage_path: Path,
+    profile_root: Path | None,
+    profile_name: str,
     debug_dir: Path,
     headed: bool,
+    browser_channel: str | None,
     *,
     json_mode: bool = False,
 ) -> dict[str, str]:
-    if not cookies_path.exists():
+    if profile_root is None and not cookies_path.exists():
         raise SystemExit(f"Missing cookies file: {cookies_path}")
     if not video_path.exists():
         raise SystemExit(f"Missing video: {video_path}")
 
     debug_dir.mkdir(parents=True, exist_ok=True)
+    temp_profile_dir: Path | None = None
 
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=not headed)
-        context_kwargs = {"viewport": {"width": 1280, "height": 720}}
-        if storage_path.exists():
-            context_kwargs["storage_state"] = str(storage_path)
-        context = await browser.new_context(**context_kwargs)
-        if not storage_path.exists():
-            await context.add_cookies(parse_cookie_file(cookies_path))
-        page = await context.new_page()
+        browser = None
+        context = None
+        if profile_root is not None:
+            temp_profile_dir = copy_user_data_tree(profile_root, profile_name)
+            context = await p.chromium.launch_persistent_context(
+                str(temp_profile_dir),
+                headless=not headed,
+                viewport={"width": 1280, "height": 720},
+                channel=browser_channel,
+                args=[f"--profile-directory={profile_name}"],
+            )
+            pages = context.pages
+            page = pages[0] if pages else await context.new_page()
+        else:
+            browser = await p.chromium.launch(headless=not headed)
+            context_kwargs = {"viewport": {"width": 1280, "height": 720}}
+            if storage_path.exists():
+                context_kwargs["storage_state"] = str(storage_path)
+            context = await browser.new_context(**context_kwargs)
+            if not storage_path.exists():
+                await context.add_cookies(parse_cookie_file(cookies_path))
+            page = await context.new_page()
         page.set_default_timeout(30000)
         uploader = InstagramUploader(page, debug_dir, verbose=not json_mode)
 
@@ -418,13 +460,26 @@ async def run_upload(
 
             await context.storage_state(path=str(storage_path))
 
-            verify_kwargs = {"viewport": {"width": 1280, "height": 1200}}
-            if storage_path.exists():
-                verify_kwargs["storage_state"] = str(storage_path)
-            verify_context = await browser.new_context(**verify_kwargs)
-            if not storage_path.exists():
-                await verify_context.add_cookies(parse_cookie_file(cookies_path))
-            verify_page = await verify_context.new_page()
+            if browser is None:
+                await context.close()
+                context = None
+                verify_context = await p.chromium.launch_persistent_context(
+                    str(temp_profile_dir),
+                    headless=not headed,
+                    viewport={"width": 1280, "height": 1200},
+                    channel=browser_channel,
+                    args=[f"--profile-directory={profile_name}"],
+                )
+                verify_pages = verify_context.pages
+                verify_page = verify_pages[0] if verify_pages else await verify_context.new_page()
+            else:
+                verify_kwargs = {"viewport": {"width": 1280, "height": 1200}}
+                if storage_path.exists():
+                    verify_kwargs["storage_state"] = str(storage_path)
+                verify_context = await browser.new_context(**verify_kwargs)
+                if not storage_path.exists():
+                    await verify_context.add_cookies(parse_cookie_file(cookies_path))
+                verify_page = await verify_context.new_page()
             verify_page.set_default_timeout(25000)
             verifier = InstagramUploader(verify_page, debug_dir, verbose=not json_mode)
             await verifier.verify_profile("verify_profile_1")
@@ -444,7 +499,12 @@ async def run_upload(
             await uploader.current_state("FAILED_STATE")
             raise SystemExit(str(exc)) from exc
         finally:
-            await browser.close()
+            if context is not None:
+                await context.close()
+            if browser is not None:
+                await browser.close()
+            if temp_profile_dir is not None:
+                shutil.rmtree(temp_profile_dir, ignore_errors=True)
 
 
 async def main() -> None:
@@ -452,13 +512,17 @@ async def main() -> None:
     cookies_path = Path(os.getenv("IG_COOKIES_FILE") or DEFAULT_COOKIES_FILE).resolve()
     db_path = Path(os.getenv("IG_DB_PATH") or DEFAULT_DB_PATH).resolve()
     storage_path = Path(os.getenv("IG_STORAGE_FILE", "state/ig_storage.json")).resolve()
+    profile_root_raw = os.getenv("IG_PROFILE_ROOT", "").strip()
+    profile_root = Path(profile_root_raw).resolve() if profile_root_raw else None
+    profile_name = os.getenv("IG_PROFILE_NAME", "Default").strip() or "Default"
+    browser_channel = os.getenv("IG_BROWSER_CHANNEL", "").strip() or None
     debug_dir = Path(os.getenv("IG_DEBUG_DIR", "state")).resolve()
     headed = env_flag("IG_HEADED", default=False)
     json_mode = env_flag("IG_JSON", default=False)
     metadata = lookup_job_metadata(video_path, db_path)
     caption = os.getenv("IG_CAPTION_TEXT") or build_instagram_caption(metadata)
     try:
-        result = await run_upload(video_path, caption, cookies_path, storage_path, debug_dir, headed, json_mode=json_mode)
+        result = await run_upload(video_path, caption, cookies_path, storage_path, profile_root, profile_name, debug_dir, headed, browser_channel, json_mode=json_mode)
     except SystemExit as exc:
         if json_mode:
             print(json.dumps({"ok": False, "message": str(exc)}))

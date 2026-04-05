@@ -209,6 +209,9 @@ async def upload_to_instagram(config: AppConfig, *, video_path: Path, caption: s
     env["IG_UPLOAD_FILE"] = str(video_path)
     env["IG_COOKIES_FILE"] = str(config.instagram_cookies_path)
     env["IG_STORAGE_FILE"] = str(config.instagram_storage_path)
+    if config.instagram_profile_dir is not None:
+        env["IG_PROFILE_ROOT"] = str(config.instagram_profile_dir)
+        env["IG_PROFILE_NAME"] = config.instagram_profile_name
     env["IG_DB_PATH"] = str(config.db_path)
     env["IG_CAPTION_TEXT"] = caption
     env["IG_JSON"] = "1"

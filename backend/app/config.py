@@ -23,6 +23,8 @@ class AppConfig:
     instagram_upload_script: Path
     instagram_cookies_path: Path
     instagram_storage_path: Path
+    instagram_profile_dir: Path | None
+    instagram_profile_name: str
     max_duration: float = 20.0
     fps: int = 24
     width: int = 1080
@@ -76,6 +78,8 @@ def load_config(root_dir: Path | None = None) -> AppConfig:
         instagram_upload_script=root / "scripts" / "ig_upload_playwright.py",
         instagram_cookies_path=Path(os.getenv("AI_VIDEO_GEN_INSTAGRAM_COOKIES_PATH", "/home/meet/Downloads/cookies (2).txt")).resolve(),
         instagram_storage_path=Path(os.getenv("AI_VIDEO_GEN_INSTAGRAM_STORAGE_PATH", str(state_dir / "ig_storage.json"))).resolve(),
+        instagram_profile_dir=Path(profile_dir).resolve() if (profile_dir := os.getenv("AI_VIDEO_GEN_INSTAGRAM_PROFILE_DIR", "").strip()) else None,
+        instagram_profile_name=os.getenv("AI_VIDEO_GEN_INSTAGRAM_PROFILE_NAME", "Default").strip() or "Default",
         telegram_bot_token=os.getenv("AI_VIDEO_GEN_TELEGRAM_BOT_TOKEN"),
         allowed_chat_ids=allowed_chat_ids,
         default_chat_id=int(default_chat_id_raw) if default_chat_id_raw else (allowed_chat_ids[0] if allowed_chat_ids else None),
