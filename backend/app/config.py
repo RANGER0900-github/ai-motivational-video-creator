@@ -25,6 +25,7 @@ class AppConfig:
     instagram_storage_path: Path
     instagram_profile_dir: Path | None
     instagram_profile_name: str
+    instagram_target_username: str
     max_duration: float = 20.0
     fps: int = 24
     width: int = 1080
@@ -80,6 +81,7 @@ def load_config(root_dir: Path | None = None) -> AppConfig:
         instagram_storage_path=Path(os.getenv("AI_VIDEO_GEN_INSTAGRAM_STORAGE_PATH", str(state_dir / "ig_storage.json"))).resolve(),
         instagram_profile_dir=Path(profile_dir).resolve() if (profile_dir := os.getenv("AI_VIDEO_GEN_INSTAGRAM_PROFILE_DIR", "").strip()) else None,
         instagram_profile_name=os.getenv("AI_VIDEO_GEN_INSTAGRAM_PROFILE_NAME", "Default").strip() or "Default",
+        instagram_target_username=os.getenv("AI_VIDEO_GEN_INSTAGRAM_TARGET_USERNAME", "void.to.victory").strip() or "void.to.victory",
         telegram_bot_token=os.getenv("AI_VIDEO_GEN_TELEGRAM_BOT_TOKEN"),
         allowed_chat_ids=allowed_chat_ids,
         default_chat_id=int(default_chat_id_raw) if default_chat_id_raw else (allowed_chat_ids[0] if allowed_chat_ids else None),

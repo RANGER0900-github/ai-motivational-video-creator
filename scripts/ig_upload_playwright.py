@@ -11,7 +11,7 @@ from playwright.async_api import async_playwright
 
 
 DEFAULT_COOKIES_FILE = Path("/home/meet/Downloads/cookies (2).txt")
-PROFILE_URL = "https://www.instagram.com/_thecoco_club/"
+DEFAULT_TARGET_USERNAME = os.getenv("IG_TARGET_USERNAME", "void.to.victory").strip() or "void.to.victory"
 DEFAULT_DB_PATH = Path("state/app.db")
 DEFAULT_HASHTAGS = (
     "#motivation #mindset #discipline #selfimprovement #success "
@@ -128,9 +128,11 @@ class InstagramUploadError(RuntimeError):
 
 
 class InstagramUploader:
-    def __init__(self, page, debug_dir: Path, *, verbose: bool = True):
+    def __init__(self, page, debug_dir: Path, *, target_username: str, verbose: bool = True):
         self.page = page
         self.debug_dir = debug_dir
+        self.target_username = target_username
+        self.profile_url = f"https://www.instagram.com/{target_username}/"
         self.verbose = verbose
 
     async def snap(self, name: str) -> None:
@@ -146,10 +148,71 @@ class InstagramUploader:
             "Get started on Instagram",
             "I already have an account",
             "Mobile number or email",
-            "Log in",
         )
         if "/accounts/login" in url or any(marker in text for marker in markers):
             raise InstagramUploadError("Instagram session is not authenticated on this server. Refresh VPS cookies/storage.")
+
+    async def maybe_activate_saved_profile(self, password: str | None = None) -> bool:
+        body = await self.body_text()
+        if "Log into Instagram" not in body:
+            return False
+        if self.target_username not in body:
+            raise InstagramUploadError(
+                f"Instagram profile picker is shown, but target account {self.target_username!r} is not available."
+            )
+        candidates = [
+            self.page.get_by_text(self.target_username, exact=True),
+            self.page.locator('[role="button"]').filter(has_text=self.target_username),
+            self.page.locator('a').filter(has_text=self.target_username),
+        ]
+        for locator in candidates:
+            count = await locator.count()
+            for index in range(count):
+                try:
+                    await locator.nth(index).click(force=True, timeout=8000)
+                    await self.page.wait_for_timeout(5000)
+                    await self.maybe_complete_password_step(password)
+                    return True
+                except Exception:
+                    continue
+        raise InstagramUploadError(f"Instagram profile picker showed {self.target_username!r}, but it could not be activated.")
+
+    async def maybe_complete_password_step(self, password: str | None) -> bool:
+        password_field = self.page.locator('input[type="password"]')
+        if await password_field.count() == 0:
+            return False
+        if not password:
+            raise InstagramUploadError(
+                f"Instagram requested a password for {self.target_username!r}. Provide IG_LOGIN_PASSWORD to continue local recovery."
+            )
+        await password_field.first.fill(password)
+        login_button_candidates = [
+            self.page.locator('button').filter(has_text="Log in"),
+            self.page.locator('[role="button"]').filter(has_text="Log in"),
+        ]
+        clicked = False
+        for locator in login_button_candidates:
+            if await locator.count():
+                try:
+                    await locator.first.click(force=True, timeout=8000)
+                    clicked = True
+                    break
+                except Exception:
+                    continue
+        if not clicked:
+            raise InstagramUploadError(f"Instagram asked for a password for {self.target_username!r}, but the Log in button was not found.")
+        await self.page.wait_for_timeout(7000)
+        return True
+
+    async def confirm_target_account_context(self) -> None:
+        body = await self.body_text()
+        if self.target_username in body:
+            return
+        current_url = self.page.url.rstrip("/")
+        if current_url.startswith(self.profile_url.rstrip("/")):
+            return
+        await self.page.goto(self.profile_url, wait_until="domcontentloaded")
+        await self.page.wait_for_timeout(3000)
 
     async def click_dialog_action(self, text: str, dialog_index: int = 0) -> tuple[int, dict]:
         candidates = []
@@ -188,14 +251,19 @@ class InstagramUploader:
                 continue
         raise InstagramUploadError(f"No dialog action found for {text!r} in dialog {dialog_index}")
 
-    async def open_create_post(self) -> None:
+    async def open_create_post(self, login_password: str | None = None) -> None:
         await self.page.goto("https://www.instagram.com/create/select/", wait_until="domcontentloaded")
         await self.page.wait_for_timeout(2500)
+        if await self.maybe_activate_saved_profile(login_password):
+            await self.current_state("AFTER_PROFILE_PICKER")
         await self.ensure_authenticated()
         if await self.page.locator('input[type="file"]').count():
+            await self.confirm_target_account_context()
             return
         await self.page.goto("https://www.instagram.com/", wait_until="domcontentloaded")
         await self.page.wait_for_timeout(2500)
+        if await self.maybe_activate_saved_profile(login_password):
+            await self.current_state("AFTER_PROFILE_PICKER_HOME")
         await self.ensure_authenticated()
         create_candidates = [
             self.page.locator('a[href="#"]').filter(has_text="Create"),
@@ -233,9 +301,37 @@ class InstagramUploader:
         raise InstagramUploadError("Instagram Post entry was not found.")
 
     async def attach_video(self, video_path: Path) -> None:
-        file_input = self.page.locator('input[type="file"]').first
-        await file_input.set_input_files(str(video_path))
-        await self.page.wait_for_timeout(5000)
+        select_button_candidates = [
+            self.page.locator('button').filter(has_text="Select from computer"),
+            self.page.locator('[role="button"]').filter(has_text="Select from computer"),
+        ]
+        for locator in select_button_candidates:
+            if await locator.count():
+                try:
+                    async with self.page.expect_file_chooser() as chooser_info:
+                        await locator.first.click(force=True, timeout=8000)
+                    chooser = await chooser_info.value
+                    await chooser.set_files(str(video_path))
+                    await self.page.wait_for_timeout(4000)
+                    if not await self.is_upload_prompt_visible():
+                        return
+                except Exception:
+                    continue
+        file_inputs = self.page.locator('input[type="file"]')
+        count = await file_inputs.count()
+        for index in range(count):
+            try:
+                await file_inputs.nth(index).set_input_files(str(video_path))
+                await self.page.wait_for_timeout(2500)
+                if not await self.is_upload_prompt_visible():
+                    return
+            except Exception:
+                continue
+        raise InstagramUploadError("Instagram upload modal opened, but the video file was not accepted.")
+
+    async def is_upload_prompt_visible(self) -> bool:
+        body = await self.body_text()
+        return "Create new post" in body and "Select from computer" in body
 
     async def dialog_buttons(self, dialog_index: int) -> list[tuple[int, str, dict | None]]:
         dialog = self.page.locator('div[role="dialog"]').nth(dialog_index)
@@ -264,12 +360,12 @@ class InstagramUploader:
         return "Video posts are now shared as reels" in text
 
     async def verify_profile(self, label: str) -> None:
-        await self.page.goto(PROFILE_URL, wait_until="domcontentloaded")
+        await self.page.goto(self.profile_url, wait_until="domcontentloaded")
         await self.page.wait_for_timeout(5000)
         await self.snap(label)
 
     async def verify_reels_tab(self, label: str) -> None:
-        await self.page.goto(f"{PROFILE_URL}reels/", wait_until="domcontentloaded")
+        await self.page.goto(f"{self.profile_url}reels/", wait_until="domcontentloaded")
         await self.page.wait_for_timeout(5000)
         await self.snap(label)
 
@@ -361,7 +457,7 @@ class InstagramUploader:
         await self.snap(label.lower())
 
     async def latest_reel_url(self) -> str:
-        await self.page.goto(f"{PROFILE_URL}reels/", wait_until="domcontentloaded")
+        await self.page.goto(f"{self.profile_url}reels/", wait_until="domcontentloaded")
         await self.page.wait_for_timeout(5000)
         anchors = self.page.locator('a[href*="/reel/"]')
         count = await anchors.count()
@@ -384,6 +480,8 @@ async def run_upload(
     debug_dir: Path,
     headed: bool,
     browser_channel: str | None,
+    target_username: str,
+    login_password: str | None,
     *,
     json_mode: bool = False,
 ) -> dict[str, str]:
@@ -419,10 +517,10 @@ async def run_upload(
                 await context.add_cookies(parse_cookie_file(cookies_path))
             page = await context.new_page()
         page.set_default_timeout(30000)
-        uploader = InstagramUploader(page, debug_dir, verbose=not json_mode)
+        uploader = InstagramUploader(page, debug_dir, target_username=target_username, verbose=not json_mode)
 
         try:
-            await uploader.open_create_post()
+            await uploader.open_create_post(login_password)
             await uploader.current_state("OPEN_POST")
 
             await uploader.attach_video(video_path)
@@ -481,7 +579,7 @@ async def run_upload(
                     await verify_context.add_cookies(parse_cookie_file(cookies_path))
                 verify_page = await verify_context.new_page()
             verify_page.set_default_timeout(25000)
-            verifier = InstagramUploader(verify_page, debug_dir, verbose=not json_mode)
+            verifier = InstagramUploader(verify_page, debug_dir, target_username=target_username, verbose=not json_mode)
             await verifier.verify_profile("verify_profile_1")
             await verifier.verify_profile("verify_profile_2")
             await verifier.verify_reels_tab("verify_reels")
@@ -516,13 +614,15 @@ async def main() -> None:
     profile_root = Path(profile_root_raw).resolve() if profile_root_raw else None
     profile_name = os.getenv("IG_PROFILE_NAME", "Default").strip() or "Default"
     browser_channel = os.getenv("IG_BROWSER_CHANNEL", "").strip() or None
+    target_username = os.getenv("IG_TARGET_USERNAME", DEFAULT_TARGET_USERNAME).strip() or DEFAULT_TARGET_USERNAME
+    login_password = os.getenv("IG_LOGIN_PASSWORD", "").strip() or None
     debug_dir = Path(os.getenv("IG_DEBUG_DIR", "state")).resolve()
     headed = env_flag("IG_HEADED", default=False)
     json_mode = env_flag("IG_JSON", default=False)
     metadata = lookup_job_metadata(video_path, db_path)
     caption = os.getenv("IG_CAPTION_TEXT") or build_instagram_caption(metadata)
     try:
-        result = await run_upload(video_path, caption, cookies_path, storage_path, profile_root, profile_name, debug_dir, headed, browser_channel, json_mode=json_mode)
+        result = await run_upload(video_path, caption, cookies_path, storage_path, profile_root, profile_name, debug_dir, headed, browser_channel, target_username, login_password, json_mode=json_mode)
     except SystemExit as exc:
         if json_mode:
             print(json.dumps({"ok": False, "message": str(exc)}))

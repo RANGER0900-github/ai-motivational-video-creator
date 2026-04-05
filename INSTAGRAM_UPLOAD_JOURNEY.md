@@ -2,107 +2,107 @@
 
 ## Goal
 
-Upload a generated video from `outputs/` to Instagram as a proper vertical reel, keeping the full `9:16` framing instead of letting Instagram shrink or crop it incorrectly.
+Upload a generated video from `outputs/` to Instagram as a real vertical reel for `void.to.victory`, keep the full `9:16` frame, include a caption, and verify that the reel is actually published.
 
-This document records the exact workflow that worked.
-
-## Working setup
+## Current working setup
 
 ### Important files
 
 - Uploader script: [scripts/ig_upload_playwright.py](/home/meet/projects/ai-video-gen/scripts/ig_upload_playwright.py)
-- Cookie file used for the logged-in session: `/home/meet/Downloads/cookies.txt`
-- Saved Playwright storage file: [state/ig_storage.json](/home/meet/projects/ai-video-gen/state/ig_storage.json)
+- Working cookie file: `/home/meet/Downloads/cookies (2).txt`
+- Refreshed Playwright storage: [state/ig_storage.json](/home/meet/projects/ai-video-gen/state/ig_storage.json)
 - Output videos folder: [outputs](/home/meet/projects/ai-video-gen/outputs)
 - Debug artifacts folder: [state](/home/meet/projects/ai-video-gen/state)
 
-### Account used during testing
+### Current target account
 
-- Instagram account: `_thecoco_club`
+- Instagram account: `void.to.victory`
 
-### Confirmed successful reel URLs
+### Current verified success
 
-- Earlier success: `https://www.instagram.com/_thecoco_club/reel/DWweIRfid1A/`
-- Final `9:16` success: `https://www.instagram.com/_thecoco_club/reel/DWwieRXmB0f/`
-- Final `9:16 + caption` success: `https://www.instagram.com/_thecoco_club/reel/DWwj_DKjMWo/`
+- Working reel URL: `https://www.instagram.com/void.to.victory/reel/DWwuhSUDCeG/`
 
-## Exact steps that worked
+## What changed from the old `_thecoco_club` flow
 
-### 1. Do not log in by username/password in automation
+The old guide was correct about the reel composer, but it assumed:
 
-That path was unreliable because Instagram triggered:
+- the target account was `_thecoco_club`
+- the session could be restored from `cookies.txt`
 
-- invalid login responses
-- recaptcha/challenge screens
-- automation blocking
+That is no longer true.
 
-The reliable approach was:
+The current working path is:
 
-1. Log into Instagram manually in Chrome.
-2. Export cookies.
-3. Save them as:
-   `/home/meet/Downloads/cookies.txt`
+- account target: `void.to.victory`
+- cookie source: `/home/meet/Downloads/cookies (2).txt`
+- Instagram may show a saved-profile picker first
+- clicking `void.to.victory` can open a password modal
+- the uploader must handle that before the create flow
 
-That cookie file was enough to reuse the session in Playwright.
+## Exact working flow
 
-## 2. Use the Playwright uploader script
+### 1. Restore the saved `void.to.victory` session
 
-The working script is:
+1. Open Instagram.
+2. If the saved-profile picker is shown, click `void.to.victory`.
+3. If Instagram asks for a password, enter it.
+4. Wait until the feed loads under the `void.to.victory` session.
 
-- [scripts/ig_upload_playwright.py](/home/meet/projects/ai-video-gen/scripts/ig_upload_playwright.py)
+This is now part of the automation path.
 
-It uses:
-
-- the newest `.mp4` from [outputs](/home/meet/projects/ai-video-gen/outputs)
-- the cookie file at `/home/meet/Downloads/cookies.txt`
-- headless Chromium by default
-
-Run it with:
-
-```bash
-source .venv/bin/activate
-python3 scripts/ig_upload_playwright.py
-```
-
-## 3. Exact Instagram upload flow
-
-This is the actual sequence that worked:
+### 2. Open the reel composer
 
 1. Open Instagram home.
 2. Click `Create`.
-3. Click the second `Post` option in the create menu.
-4. Set the hidden `input[type="file"]` directly with the MP4 file path.
-5. Wait for the crop composer to load.
-6. If the reels info modal appears, click `OK`.
-7. Open the crop menu from the bottom-left crop icon.
-8. Select `9:16`.
-9. Close the crop menu again.
-10. Click top-right `Next`.
-11. Click top-right `Next` again on the edit screen.
-12. On the `New reel` screen, fill the caption field.
-13. Click top-right `Share`.
-14. Wait until the UI shows `Sharing`.
+3. Click `Post`.
+4. Wait for the `Create new post` modal.
 
-## 3A. Exact caption flow that worked
+The important signal here is:
 
-The uploader now adds a real Instagram caption before publishing.
+- `Create new post`
+- `Drag photos and videos here`
+- `Select from computer`
 
-Source of caption data:
+### 3. Upload the video correctly
 
-- quote: read from `state/app.db`
-- author: read from `state/app.db`
-- selected video: matched from the chosen file in `outputs/`
+The reliable order for this account is:
 
-The caption format that worked was:
+1. Use the real `Select from computer` chooser first.
+2. If needed, fall back to direct `input[type="file"]` injection.
 
-1. Quote text
-2. Author line
+This mattered because the direct hidden-input path could trigger:
+
+- `Something went wrong`
+- `-1 files were not uploaded`
+
+Chooser-first fixed that.
+
+### 4. Reel composer steps
+
+After the file is accepted:
+
+1. If the reels info modal appears, click `OK`.
+2. Open the crop selector.
+3. Select `9:16`.
+4. Close the crop selector.
+5. Click `Next`.
+6. On the edit screen, click `Next` again.
+7. On `New reel`, fill the caption.
+8. Click `Share`.
+9. Wait until the UI shows `Sharing`.
+
+## Working caption format
+
+The uploader reads metadata from `state/app.db` and builds:
+
+1. Quote
+2. Author
 3. Blank line
-4. Short CTA line
+4. CTA
 5. Blank line
 6. Hashtag block
 
-Exact example from the successful reel:
+Example that was verified live:
 
 ```text
 The successful warrior is the average man, with laser-like focus.
@@ -113,204 +113,101 @@ Save this reel and come back when you need the reminder.
 #motivation #mindset #discipline #selfimprovement #success #focus #reels #explorepage #viralreels #motivationdaily
 ```
 
-The uploader fills this into the `Write a caption...` field on the `New reel` screen before clicking `Share`.
+## The crucial 9:16 fix
 
-## 4. The crucial 9:16 fix
+The crop selector must be controlled explicitly.
 
-This was the main issue.
-
-Earlier uploads published successfully, but the reel looked wrong because the script never controlled the crop selector.
-
-The crop UI exposes these options:
+Available crop options:
 
 - `Original`
 - `1:1`
 - `9:16`
 - `16:9`
 
-The correct fix was:
+The correct flow is:
 
-1. Open the crop selector.
-2. Explicitly choose `9:16`.
-3. Close the crop selector.
-4. Only then continue to `Next`.
+1. Open crop selector
+2. Choose `9:16`
+3. Close crop selector
+4. Only then continue
 
-Without this, Instagram was keeping the wrong crop state and the reel looked shrunk.
+Without this, Instagram can publish a shrunk or wrong-looking reel.
 
-## 5. Exact crop controls discovered by scraping
+## Exact controls that matter
 
-These were the important controls found in the crop dialog:
+### Crop composer
 
 - top-right action: `Next`
-- bottom-left icon: `Select crop`
-- crop options inside the dialog:
+- bottom-left crop toggle: `Select crop`
+- crop options:
   - `Original`
   - `1:1`
   - `9:16`
   - `16:9`
 
-The crop toggle is not a simple labeled button. The stable way was to target:
+### New reel screen
 
-- `svg[aria-label="Select crop"]`
-- then click its nearest ancestor button/role-button
+- top-right action: `Share`
+- caption field: `Write a caption...`
 
-The crop options themselves were found as:
+### Verification target
 
-- dialog-scoped `[role="button"]` entries
+- profile: `https://www.instagram.com/void.to.victory/`
+- reels tab: `https://www.instagram.com/void.to.victory/reels/`
 
-## 6. Why the earlier version failed
+## Mistakes to avoid
 
-The earlier uploader had several false positives.
+### 1. Do not assume old cookie files still match the target account
 
-### Mistake 1: “Feed returned” was treated as success
+The old `cookies.txt` and related artifacts were tied to older session assumptions.
 
-That was wrong.
+The working file for the current account is:
 
-Returning to the feed did not prove a reel was published.
+- `/home/meet/Downloads/cookies (2).txt`
 
-### Mistake 2: Generic text clicking
+### 2. Do not assume `_thecoco_club`
 
-Using broad selectors like:
+The uploader and verification must target:
 
-- `text=Next`
-- `text=Share`
-- generic “visible text click”
+- `void.to.victory`
 
-caused the script to hit the wrong element in the composer.
+### 3. Do not treat the saved-profile picker as “fully logged out”
 
-That caused:
+If Instagram shows:
 
-- staying on crop
-- opening `Discard post?`
-- thinking the post was done when it was not
+- `Log into Instagram`
+- a row for `void.to.victory`
 
-### Mistake 3: No explicit crop handling
+that is a recoverable state. Click the profile and continue. For this account, Instagram can still ask for the password after that step.
 
-This is what caused the “shrunk reel” result.
+### 4. Do not trust “back on feed” as a success signal
 
-The script published the video, but it never selected `9:16`.
+Real verification requires:
 
-## 7. What the script must always do now
-
-If this uploader is reused, the non-negotiable sequence is:
-
-1. cookie-based auth
-2. upload file directly
-3. handle reels modal
-4. open crop menu
-5. select `9:16`
-6. close crop menu
-7. `Next`
-8. `Next`
-9. fill caption from quote + author + CTA + hashtags
-10. `Share`
-11. verify the new reel URL
-
-## 8. How to verify the upload really worked
-
-Do not trust just one signal.
-
-Use all of these:
-
-### Verification 1: Composer state
-
-Confirm the composer reaches:
-
-- `New reel`
-- then `Sharing`
-
-### Verification 2: Reels tab
-
-Open:
-
-- `https://www.instagram.com/_thecoco_club/reels/`
-
-Confirm there is a new top reel tile.
-
-### Verification 3: Direct reel URL
-
-Open the newest reel URL directly and confirm:
-
-- it loads
-- it says something like `1 minute ago`
-- the page contains a real `<video>`
+- reels tab contains the new reel
+- direct reel URL opens
+- a real `<video>` is present
 - the caption text is present
-- the hashtags are present
 
-### Verification 4: Video dimensions
+### 5. Do not rely only on hidden file input upload
 
-From the successful final run, Playwright reported:
+For `void.to.victory`, chooser-first is more reliable than direct hidden-input upload.
 
-- width: `720`
-- height: `1280`
-- duration: `17`
+## Verified result
 
-That confirms the uploaded reel itself is proper `9:16`.
+The current successful local run produced:
 
-## Final successful verification
+- reel URL: `https://www.instagram.com/void.to.victory/reel/DWwuhSUDCeG/`
+- profile target: `void.to.victory`
+- `VIDEO_COUNT = 1`
+- caption text present
+- timestamp around `1m`
 
-The final correct `9:16` upload produced:
+## Useful proof artifacts
 
-- reel URL: `https://www.instagram.com/_thecoco_club/reel/DWwieRXmB0f/`
-- reel timestamp: `1 minute ago`
-- video dimensions: `720x1280`
-- duration: `17`
-
-The final correct `9:16 + caption` upload produced:
-
-- reel URL: `https://www.instagram.com/_thecoco_club/reel/DWwj_DKjMWo/`
-- quote shown in caption: `The successful warrior is the average man, with laser-like focus.`
-- author shown in caption: `Bruce Lee`
-- hashtags shown in caption:
-  `#motivation #mindset #discipline #selfimprovement #success #focus #reels #explorepage #viralreels #motivationdaily`
-- video dimensions: `720x1280`
-
-## Important debug artifacts
-
-These files are useful if the flow breaks again:
-
-- crop composer after selecting `9:16`:
-  [after_crop_9_16.png](/home/meet/projects/ai-video-gen/state/after_crop_9_16.png)
-- final reels tab:
-  [verify_reels.png](/home/meet/projects/ai-video-gen/state/verify_reels.png)
-- newest reel detail page:
-  [verify_reel_detail_latest.png](/home/meet/projects/ai-video-gen/state/verify_reel_detail_latest.png)
-- newest reel detail page with caption verification:
-  [verify_reel_caption_latest.png](/home/meet/projects/ai-video-gen/state/verify_reel_caption_latest.png)
-- crop menu probe:
-  [crop_menu_probe.png](/home/meet/projects/ai-video-gen/state/crop_menu_probe.png)
-
-## If Instagram changes the UI again
-
-Inspect these first:
-
-1. active dialog count
-2. whether the reels modal appears immediately after upload or after `Next`
-3. the top-right `Next` / `Share` controls inside the main dialog
-4. the bottom-left crop control
-5. the crop option labels inside the crop menu
-
-Do not switch back to broad page-wide text clicking unless there is no alternative.
-
-## Minimal operator checklist
-
-If you want to upload a new video to Instagram in proper `9:16`, follow this:
-
-1. Make sure Chrome is already logged into the target Instagram account.
-2. Export cookies to:
-   `/home/meet/Downloads/cookies.txt`
-3. Make sure the target `.mp4` is inside [outputs](/home/meet/projects/ai-video-gen/outputs).
-4. Run:
-
-```bash
-source .venv/bin/activate
-python3 scripts/ig_upload_playwright.py
-```
-
-5. After it finishes, verify:
-   - newest reel appears on `/_thecoco_club/reels/`
-   - newest reel URL opens
-   - video reports `720x1280`
-   - caption contains the quote, author, and hashtag block
-
-That is the working end-to-end method.
+- [after_profile_picker_home.png](/home/meet/projects/ai-video-gen/state/after_profile_picker_home.png)
+- [after_crop_9_16.png](/home/meet/projects/ai-video-gen/state/after_crop_9_16.png)
+- [after_caption.png](/home/meet/projects/ai-video-gen/state/after_caption.png)
+- [after_share.png](/home/meet/projects/ai-video-gen/state/after_share.png)
+- [verify_void_reels.png](/home/meet/projects/ai-video-gen/state/verify_void_reels.png)
+- [verify_void_reel_detail.png](/home/meet/projects/ai-video-gen/state/verify_void_reel_detail.png)

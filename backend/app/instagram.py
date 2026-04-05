@@ -214,6 +214,7 @@ async def upload_to_instagram(config: AppConfig, *, video_path: Path, caption: s
         env["IG_PROFILE_NAME"] = config.instagram_profile_name
     env["IG_DB_PATH"] = str(config.db_path)
     env["IG_CAPTION_TEXT"] = caption
+    env["IG_TARGET_USERNAME"] = config.instagram_target_username
     env["IG_JSON"] = "1"
     process = await asyncio.create_subprocess_exec(
         "python3",
