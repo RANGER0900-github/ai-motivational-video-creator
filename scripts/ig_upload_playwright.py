@@ -388,7 +388,18 @@ class InstagramUploader:
                     options.append(label)
         return options
 
+    async def crop_preview_is_portrait(self) -> bool:
+        preview = self.page.locator('div[role="dialog"] video').first
+        if await preview.count() == 0:
+            return False
+        box = await preview.bounding_box()
+        if not box or box["width"] <= 0 or box["height"] <= 0:
+            return False
+        return box["height"] / box["width"] >= 1.3
+
     async def select_crop_ratio(self, label: str) -> None:
+        if await self.crop_preview_is_portrait():
+            return
         if not await self.open_crop_menu():
             return
         options = await self.crop_options()
@@ -460,6 +471,24 @@ class InstagramUploader:
             print(f"{label}_TEXT: {(await self.body_text())[:1500].replace(chr(10), ' | ')}")
             print(f"{label}_DIALOGS: {dialog_count}")
         await self.snap(label.lower())
+
+    async def wait_for_sharing_to_finish(self, timeout_ms: int = 90000) -> None:
+        deadline = asyncio.get_running_loop().time() + (timeout_ms / 1000)
+        while asyncio.get_running_loop().time() < deadline:
+            dialogs = self.page.locator('div[role="dialog"]')
+            active_sharing = False
+            for idx in range(await dialogs.count()):
+                try:
+                    text = await dialogs.nth(idx).inner_text()
+                except Exception:
+                    continue
+                if "Sharing" in text:
+                    active_sharing = True
+                    break
+            if not active_sharing:
+                return
+            await self.page.wait_for_timeout(2000)
+        raise InstagramUploadError("Instagram stayed on the Sharing step for too long.")
 
     async def latest_reel_url(self) -> str:
         await self.page.goto(f"{self.profile_url}reels/", wait_until="domcontentloaded")
@@ -559,8 +588,9 @@ async def run_upload(
             await uploader.current_state("AFTER_CAPTION")
 
             await uploader.click_dialog_action("Share")
-            await page.wait_for_timeout(12000)
-            await uploader.current_state("AFTER_SHARE")
+            await uploader.wait_for_sharing_to_finish()
+            if not json_mode:
+                await uploader.current_state("AFTER_SHARE")
 
             await context.storage_state(path=str(storage_path))
 
