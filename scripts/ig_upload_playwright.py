@@ -377,6 +377,19 @@ class InstagramUploader:
         await self.page.wait_for_timeout(1500)
         return True
 
+    async def crop_menu_is_open(self) -> bool:
+        dialog = self.page.locator('div[role="dialog"]').first
+        for label in ("Original", "1:1", "9:16", "16:9"):
+            locator = dialog.locator('[role="button"]').filter(has_text=label)
+            if await locator.count():
+                try:
+                    box = await locator.first.bounding_box()
+                except Exception:
+                    box = None
+                if box and box["width"] > 0 and box["height"] > 0:
+                    return True
+        return False
+
     async def crop_options(self) -> list[str]:
         dialog = self.page.locator('div[role="dialog"]').first
         options = []
@@ -397,8 +410,8 @@ class InstagramUploader:
             return False
         return box["height"] / box["width"] >= 1.3
 
-    async def select_crop_ratio(self, label: str) -> None:
-        if await self.crop_preview_is_portrait():
+    async def select_crop_ratio(self, label: str, *, force: bool = False) -> None:
+        if not force and await self.crop_preview_is_portrait():
             return
         if not await self.open_crop_menu():
             return
@@ -414,16 +427,98 @@ class InstagramUploader:
             raise InstagramUploadError(f"Crop option {label!r} had no visible bounding box.")
         await self.page.mouse.click(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
         await self.page.wait_for_timeout(1500)
-        if not await self.open_crop_menu():
+        await self.close_crop_menu()
+
+    async def edit_preview_is_portrait(self) -> bool:
+        preview = self.page.locator('div[role="dialog"] video').first
+        if await preview.count() == 0:
+            return False
+        box = await preview.bounding_box()
+        if not box or box["width"] <= 0 or box["height"] <= 0:
+            return False
+        return box["height"] / box["width"] >= 1.3
+
+    async def go_back_once(self) -> None:
+        candidates = [
+            self.page.locator('svg[aria-label="Back"]').locator("xpath=ancestor::*[@role='button' or self::button][1]"),
+            self.page.locator('[role="button"][aria-label="Back"]'),
+        ]
+        for locator in candidates:
+            if await locator.count():
+                try:
+                    await locator.first.click(force=True, timeout=8000)
+                    await self.page.wait_for_timeout(1500)
+                    return
+                except Exception:
+                    continue
+        raise InstagramUploadError("Back button was not found on the Instagram composer.")
+
+    async def ensure_edit_preview_portrait(self) -> None:
+        if await self.edit_preview_is_portrait():
             return
-        await self.page.wait_for_timeout(800)
+        await self.go_back_once()
+        await self.page.wait_for_timeout(1200)
+        await self.select_crop_ratio("Original", force=True)
+        await self.current_state("AFTER_FORCED_CROP_9_16")
+        await self.assert_crop_menu_closed()
+        await self.click_dialog_action("Next")
+        await self.page.wait_for_timeout(1800)
+        if not await self.edit_preview_is_portrait():
+            raise InstagramUploadError("Instagram edit preview stayed square after forcing 9:16 crop.")
+
+    async def close_crop_menu(self) -> None:
+        if not await self.crop_menu_is_open():
+            return
+        preview = self.page.locator('div[role="dialog"] video').first
+        if await preview.count():
+            box = await preview.bounding_box()
+            if box and box["width"] > 0 and box["height"] > 0:
+                await self.page.mouse.click(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
+                await self.page.wait_for_timeout(1000)
+        if await self.crop_menu_is_open():
+            dialog = self.page.locator('div[role="dialog"]').first
+            box = await dialog.bounding_box()
+            if box and box["width"] > 0 and box["height"] > 0:
+                await self.page.mouse.click(box["x"] + box["width"] - 20, box["y"] + 20)
+                await self.page.wait_for_timeout(1000)
+        if await self.crop_menu_is_open():
+            await self.page.keyboard.press("Escape")
+            await self.page.wait_for_timeout(800)
+        if await self.crop_menu_is_open():
+            raise InstagramUploadError("Crop menu stayed open after trying to close it.")
+
+    async def go_to_edit_from_crop(self) -> None:
+        await self.assert_crop_menu_closed()
+        await self.click_dialog_action("Next")
+        await self.page.wait_for_timeout(1800)
+        if await self.has_reels_dialog():
+            await self.dismiss_reels_dialog()
+            await self.page.wait_for_timeout(1200)
+
+    async def choose_portrait_crop_for_edit(self) -> str:
+        if not await self.open_crop_menu():
+            raise InstagramUploadError("Instagram crop toggle was not available on the crop screen.")
+        available = await self.crop_options()
+        await self.close_crop_menu()
+        preferred = [label for label in ("Original", "9:16", "16:9", "1:1") if label in available]
+        if not preferred:
+            raise InstagramUploadError("No Instagram crop options were available on the crop screen.")
+        last_error = "Instagram edit preview never became portrait."
+        for index, label in enumerate(preferred):
+            await self.select_crop_ratio(label, force=True)
+            await self.current_state(f"CROP_TRY_{label.replace(':', '_')}")
+            await self.go_to_edit_from_crop()
+            await self.current_state(f"EDIT_TRY_{label.replace(':', '_')}")
+            if await self.edit_preview_is_portrait():
+                return label
+            last_error = f"Instagram edit preview stayed square after trying crop option {label!r}."
+            if index < len(preferred) - 1:
+                await self.go_back_once()
+                await self.page.wait_for_timeout(1500)
+        raise InstagramUploadError(last_error)
 
     async def assert_crop_menu_closed(self) -> None:
-        if not await self.page.locator('svg[aria-label="Select crop"]').count():
-            return
-        dialog = self.page.locator('div[role="dialog"]').first
-        text = await dialog.inner_text()
-        if "Original" in text and "1:1" in text and "9:16" in text and "16:9" in text:
+        if await self.crop_menu_is_open():
             raise InstagramUploadError("Crop menu stayed open after selecting the ratio.")
 
     async def fill_caption(self, caption: str) -> None:
@@ -503,6 +598,19 @@ class InstagramUploader:
                 return f"https://www.instagram.com{href}"
         raise InstagramUploadError("Could not find the newest reel URL on the reels tab.")
 
+    async def published_reel_dimensions(self, reel_url: str) -> dict[str, int]:
+        await self.page.goto(reel_url, wait_until="domcontentloaded")
+        await self.page.wait_for_timeout(5000)
+        video = self.page.locator("video").first
+        if await video.count() == 0:
+            raise InstagramUploadError("Published reel page did not expose a video element.")
+        for _ in range(10):
+            info = await video.evaluate("el => ({w: el.videoWidth || 0, h: el.videoHeight || 0, cw: el.clientWidth || 0, ch: el.clientHeight || 0})")
+            if info["w"] > 0 and info["h"] > 0:
+                return info
+            await self.page.wait_for_timeout(1000)
+        raise InstagramUploadError("Published reel video dimensions never became available.")
+
 
 async def run_upload(
     video_path: Path,
@@ -564,16 +672,10 @@ async def run_upload(
                 await uploader.dismiss_reels_dialog()
                 await uploader.current_state("AFTER_REELS_OK")
 
-            await uploader.select_crop_ratio("9:16")
-            await uploader.current_state("AFTER_CROP_9_16")
-            await uploader.assert_crop_menu_closed()
-
-            await uploader.click_dialog_action("Next")
-            await uploader.current_state("AFTER_FIRST_NEXT")
-
-            if await uploader.has_reels_dialog():
-                await uploader.dismiss_reels_dialog()
-                await uploader.current_state("AFTER_REELS_OK_POST_NEXT")
+            chosen_crop = await uploader.choose_portrait_crop_for_edit()
+            if not json_mode:
+                print(f"CHOSEN_CROP: {chosen_crop}")
+            await uploader.current_state("AFTER_EDIT_RATIO_CHECK")
 
             await uploader.click_dialog_action("Next")
             await uploader.current_state("AFTER_SECOND_NEXT")
@@ -620,11 +722,18 @@ async def run_upload(
             await verifier.verify_profile("verify_profile_2")
             await verifier.verify_reels_tab("verify_reels")
             reel_url = await verifier.latest_reel_url()
+            dimensions = await verifier.published_reel_dimensions(reel_url)
             await verify_context.close()
+            if dimensions["h"] <= dimensions["w"]:
+                raise InstagramUploadError(
+                    f"Published Instagram reel is not portrait: {dimensions['w']}x{dimensions['h']}."
+                )
             return {
                 "reelUrl": reel_url,
                 "reelPath": reel_url.replace("https://www.instagram.com", ""),
                 "caption": caption,
+                "videoWidth": str(dimensions["w"]),
+                "videoHeight": str(dimensions["h"]),
             }
         except PlaywrightTimeoutError as exc:
             await uploader.current_state("TIMEOUT_STATE")
