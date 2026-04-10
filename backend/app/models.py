@@ -8,7 +8,7 @@ from pydantic import BaseModel, Field
 
 JobStatus = Literal["queued", "preparing", "rendering", "finalizing", "completed", "failed", "cancelled"]
 JobOrigin = Literal["manual", "loop", "resend"]
-DeliveryStatus = Literal["pending", "sent", "failed", "skipped"]
+DeliveryStatus = Literal["pending", "sending", "sent", "failed", "skipped"]
 
 
 class QuoteRecord(BaseModel):

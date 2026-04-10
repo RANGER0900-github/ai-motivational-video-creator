@@ -1,213 +1,389 @@
-# Instagram 9:16 Upload Guide
+# Instagram Upload System Runbook (Never Forget Version)
 
-## Goal
+This document is the source of truth for getting Instagram uploads working end-to-end from both:
 
-Upload a generated video from `outputs/` to Instagram as a real vertical reel for `void.to.victory`, keep the full `9:16` frame, include a caption, and verify that the reel is actually published.
+- direct script execution
+- Telegram "Upload to Instagram" button flow
 
-## Current working setup
+It is intentionally detailed so recovery does not depend on memory.
 
-### Important files
+---
 
-- Uploader script: [scripts/ig_upload_playwright.py](/home/meet/projects/ai-video-gen/scripts/ig_upload_playwright.py)
-- Working cookie file: `/home/meet/Downloads/cookies (2).txt`
-- Refreshed Playwright storage: [state/ig_storage.json](/home/meet/projects/ai-video-gen/state/ig_storage.json)
-- Output videos folder: [outputs](/home/meet/projects/ai-video-gen/outputs)
-- Debug artifacts folder: [state](/home/meet/projects/ai-video-gen/state)
+## 1. Objective and hard success criteria
 
-### Current target account
+### Objective
 
-- Instagram account: `void.to.victory`
+Publish generated videos to Instagram reels for `void.to.victory` with portrait output and stable automation.
 
-### Current verified success
+### Hard success criteria
 
-- Working reel URL: `https://www.instagram.com/void.to.victory/reel/DWwuhSUDCeG/`
+1. Reel is published and URL is returned.
+2. Published reel video dimensions are portrait (`height > width`), target shape `9:16`.
+3. Queue item transitions correctly:
+   - `pending -> uploading -> uploaded` on success
+   - `pending/uploading -> failed|blocked` on failure
+4. Telegram button never silently does nothing:
+   - user gets an in-progress, queued, success, or blocked signal.
 
-## What changed from the old `_thecoco_club` flow
+---
 
-The old guide was correct about the reel composer, but it assumed:
+## 2. Current architecture (real flow)
 
-- the target account was `_thecoco_club`
-- the session could be restored from `cookies.txt`
+### Runtime components
 
-That is no longer true.
+- Bot runtime: `backend/app/telegram_bot.py`
+- Instagram queue store: `backend/app/instagram.py`
+- Playwright uploader: `scripts/ig_upload_playwright.py`
 
-The current working path is:
+### Data/state files
 
-- account target: `void.to.victory`
-- cookie source: `/home/meet/Downloads/cookies (2).txt`
-- Instagram may show a saved-profile picker first
-- clicking `void.to.victory` can open a password modal
-- the uploader must handle that before the create flow
+- Queue state: `state/instagram_queue.json`
+- Bot env: `state/bot.env`
+- Storage state: `state/ig_storage.json`
+- Cookie source used on VPS: `state/instagram_cookies.txt`
+- Job metadata DB: `state/app.db`
 
-## Exact working flow
+### Trigger paths
 
-### 1. Restore the saved `void.to.victory` session
+1. Loop/manual completion path:
+   - completed job can be auto-enqueued for IG.
+2. Telegram button path:
+   - callback `igup:<job_id>`
+   - queue item is created or retried
+   - background worker picks next ready item
+   - upload subprocess launched with JSON output contract
 
-1. Open Instagram.
-2. If the saved-profile picker is shown, click `void.to.victory`.
-3. If Instagram asks for a password, enter it.
-4. Wait until the feed loads under the `void.to.victory` session.
+---
 
-This is now part of the automation path.
+## 3. Confirmed working baseline (important)
 
-### 2. Open the reel composer
+The following direct VPS run has already succeeded with the current flow:
+
+- reel URL: `https://www.instagram.com/void.to.victory/reel/DW3nZ6cDAlL/`
+- returned dimensions: `720x1280` (portrait)
+
+This proves:
+
+- cookies/session can work on VPS
+- Playwright upload script can complete on VPS
+- caption + verification path can succeed
+
+---
+
+## 4. Required environment and files
+
+### Must exist in `state/bot.env`
+
+- `AI_VIDEO_GEN_INSTAGRAM_COOKIES_PATH=/home/yt/ai-video-gen/state/instagram_cookies.txt`
+- `AI_VIDEO_GEN_INSTAGRAM_STORAGE_PATH=/home/yt/ai-video-gen/state/ig_storage.json`
+- `AI_VIDEO_GEN_INSTAGRAM_TARGET_USERNAME=void.to.victory`
+- `IG_LOGIN_PASSWORD=...` (if Instagram prompts password)
+- `IG_BROWSER_CHANNEL=chromium`
+- `AI_VIDEO_GEN_INSTAGRAM_UPLOAD_TIMEOUT_SECONDS=900`
+
+### Runtime preflight log now emitted
+
+`backend/app/instagram.py` logs this before each upload:
+
+- script exists
+- cookies exists
+- storage exists
+- profile_dir exists
+- target username
+- timeout
+- browser channel
+- Playwright browsers path
+
+If upload fails, check this log first.
+
+---
+
+## 5. Exact Playwright method that works
+
+This is mandatory and enforced in code.
+
+### Phase A: account/session restore
 
 1. Open Instagram home.
-2. Click `Create`.
-3. Click `Post`.
-4. Wait for the `Create new post` modal.
+2. If saved-profile picker appears, activate `void.to.victory`.
+3. If password modal appears, submit password.
+4. Confirm authenticated state.
 
-The important signal here is:
+### Phase B: strict composer entry
 
-- `Create new post`
-- `Drag photos and videos here`
-- `Select from computer`
+1. Click `Create`.
+2. Click `Post` (not Reel-first for entry).
+3. Continue only if modal shows:
+   - `Create new post`
+   - `Select from computer`
 
-### 3. Upload the video correctly
+If this composer is not visible, abort with explicit error.
 
-The reliable order for this account is:
+### Phase C: file attach
 
-1. Use the real `Select from computer` chooser first.
-2. If needed, fall back to direct `input[type="file"]` injection.
+1. Prefer real chooser from `Select from computer`.
+2. Fallback to `input[type=file]` only if needed.
+3. Immediately abort if page shows:
+   - `Only images can be posted`
 
-This mattered because the direct hidden-input path could trigger:
+### Phase D: reel edit/share
 
-- `Something went wrong`
-- `-1 files were not uploaded`
+1. Handle reel info modal `OK` if present.
+2. Open crop selector.
+3. Prefer `9:16` (fallback order: `9:16`, `Original`, `16:9`, `1:1`).
+4. Confirm portrait edit preview.
+5. `Next` to caption.
+6. Fill caption.
+7. `Share`.
 
-Chooser-first fixed that.
+### Phase E: verify publish
 
-### 4. Reel composer steps
+1. Open profile twice (stability guard).
+2. Open reels tab.
+3. Resolve latest reel URL.
+4. Read published video dimensions.
+5. If live read fails, fallback to local uploaded file dimensions.
 
-After the file is accepted:
+---
 
-1. If the reels info modal appears, click `OK`.
-2. Open the crop selector.
-3. Select `9:16`.
-4. Close the crop selector.
-5. Click `Next`.
-6. On the edit screen, click `Next` again.
-7. On `New reel`, fill the caption.
-8. Click `Share`.
-9. Wait until the UI shows `Sharing`.
+## 6. Telegram button flow details and guardrails
 
-## Working caption format
+### Callback path
 
-The uploader reads metadata from `state/app.db` and builds:
+- Callback data format: `igup:<job_id>`
+- Job must be `completed` with valid `output_path`.
 
-1. Quote
-2. Author
-3. Blank line
-4. CTA
-5. Blank line
-6. Hashtag block
+### Manual retry behavior (now required)
 
-Example that was verified live:
+On button click, queue logic must:
 
-```text
-The successful warrior is the average man, with laser-like focus.
-— Bruce Lee
+1. Refresh/recover stale `uploading` entries.
+2. If an upload task is already active and fresh, return "already in progress".
+3. If active task is stale, cancel it.
+4. Prepare manual retry:
+   - set status `pending` for non-auth failures
+   - reset `attempt_count=0`
+   - clear `last_attempt_at`
+   - clear `last_error`
+   - keep auth block strict (`auth` remains blocked)
+5. Re-fetch queue item after scheduling (do not trust stale pre-schedule item).
 
-Save this reel and come back when you need the reminder.
+This prevents the historical bug where button looked queued but used stale status.
 
-#motivation #mindset #discipline #selfimprovement #success #focus #reels #explorepage #viralreels #motivationdaily
+---
+
+## 7. Queue state contract
+
+Each item in `state/instagram_queue.json` has:
+
+- `instagram_status`: `pending | uploading | uploaded | failed | blocked`
+- `attempt_count`
+- `last_attempt_at`
+- `last_error`
+- `instagram_url` when uploaded
+
+### Global controls
+
+- `blocked_reason`: empty or `auth|runtime|ratio`
+- `auth_blocked`: boolean
+
+### Expected meanings
+
+- `failed`: retryable (manual retry should reset attempts)
+- `blocked` + `auth`: do not auto-clear; refresh cookies/session first
+- `blocked` + `runtime`: operator may clear via manual retry after fix
+
+---
+
+## 8. Failure matrix (symptom -> cause -> exact action)
+
+### Symptom: button click, no upload starts
+
+Likely cause:
+
+- stale callback item state
+- attempts exhausted but not reset
+
+Action:
+
+- verify callback log fields:
+  - previous status/attempts
+  - new status/attempts
+- confirm item is `pending` then `uploading`.
+
+### Symptom: queue stuck in `uploading`
+
+Likely cause:
+
+- stale worker task / hanging subprocess
+
+Action:
+
+1. Check active processes:
+   - `pgrep -af ig_upload_playwright.py`
+2. Check queue `last_attempt_at`.
+3. If older than watchdog threshold:
+   - cancel stale task (bot watchdog does this)
+   - recover to `failed`
+   - retry manually.
+
+### Symptom: `Only images can be posted`
+
+Likely cause:
+
+- file attached outside valid composer context
+
+Action:
+
+- verify screenshots:
+  - `state/open_post.png`
+  - `state/pre_attach.png`
+  - `state/failed_state.png`
+- ensure composer modal contains `Create new post` and `Select from computer`.
+
+### Symptom: upload fails with `Target crashed`
+
+Likely cause:
+
+- Chromium/Playwright process instability
+
+Action:
+
+1. Ensure `IG_BROWSER_CHANNEL=chromium`.
+2. Ensure Playwright browser binaries exist.
+3. Restart bot worker.
+4. Manual retry from button after reset.
+
+---
+
+## 9. Debug screenshots and checkpoint meanings
+
+Mandatory screenshots and what they indicate:
+
+- `after_profile_picker_home.png`
+  - authenticated feed reached
+- `open_post.png`
+  - composer opened
+- `pre_attach.png`
+  - attach starts only with valid modal
+- `post_attach.png` / `after_file.png`
+  - file accepted
+- `pre_next_1.png` / `pre_next_2.png`
+  - dialog has next action at required step
+- `pre_share.png`
+  - ready to publish
+- `failed_state.png`
+  - final failure snapshot for diagnosis
+
+If these are missing or out-of-order, execution path is broken.
+
+---
+
+## 10. Operational command checklist
+
+### A. Verify bot and uploader processes
+
+```bash
+pgrep -af "python -m app.telegram_bot"
+pgrep -af ig_upload_playwright.py
 ```
 
-## The crucial 9:16 fix
+### B. Inspect queue quickly
 
-The crop selector must be controlled explicitly.
+```bash
+python3 - <<'PY'
+import json
+from pathlib import Path
+obj=json.loads(Path("state/instagram_queue.json").read_text())
+print("blocked_reason:", obj.get("blocked_reason"), "auth_blocked:", obj.get("auth_blocked"))
+for it in obj.get("items", [])[-5:]:
+    print(it.get("job_id"), it.get("instagram_status"), it.get("attempt_count"), it.get("last_error"), it.get("instagram_url"))
+PY
+```
 
-Available crop options:
+### C. Restart bot cleanly
 
-- `Original`
-- `1:1`
-- `9:16`
-- `16:9`
+```bash
+screen -S ai-video-gen-bot -X quit || true
+./scripts/start_bot_screen.sh
+screen -ls
+```
 
-The correct flow is:
+### D. Direct uploader sanity test (VPS)
 
-1. Open crop selector
-2. Choose `9:16`
-3. Close crop selector
-4. Only then continue
+```bash
+set -a && source state/bot.env && set +a
+IG_JSON=1 \
+IG_UPLOAD_FILE=/home/yt/ai-video-gen/outputs/<video>.mp4 \
+IG_COOKIES_FILE=/home/yt/ai-video-gen/state/instagram_cookies.txt \
+IG_STORAGE_FILE=/home/yt/ai-video-gen/state/ig_storage.json \
+IG_TARGET_USERNAME=void.to.victory \
+./.venv/bin/python scripts/ig_upload_playwright.py
+```
 
-Without this, Instagram can publish a shrunk or wrong-looking reel.
+Expected output:
 
-## Exact controls that matter
+```json
+{"ok": true, "reelUrl": "...", "videoWidth": "...", "videoHeight": "..."}
+```
 
-### Crop composer
+---
 
-- top-right action: `Next`
-- bottom-left crop toggle: `Select crop`
-- crop options:
-  - `Original`
-  - `1:1`
-  - `9:16`
-  - `16:9`
+## 11. Never-forget rules
 
-### New reel screen
+1. Do not attach files unless `Create new post` modal is visible.
+2. Do not trust stale queue item state in callback; always re-read after scheduling.
+3. Manual retry must reset attempts for non-auth failures.
+4. Treat `uploading` older than watchdog threshold as stale and recover it.
+5. Keep auth block strict: no blind bypass when `blocked_reason=auth`.
+6. Verify real publish via reel URL and portrait dimensions, not by feed-only observation.
 
-- top-right action: `Share`
-- caption field: `Write a caption...`
+---
 
-### Verification target
+## 12. Known-good references
 
-- profile: `https://www.instagram.com/void.to.victory/`
-- reels tab: `https://www.instagram.com/void.to.victory/reels/`
+- Script: [scripts/ig_upload_playwright.py](/home/meet/projects/ai-video-gen/scripts/ig_upload_playwright.py)
+- Queue store: [backend/app/instagram.py](/home/meet/projects/ai-video-gen/backend/app/instagram.py)
+- Telegram callback/worker: [backend/app/telegram_bot.py](/home/meet/projects/ai-video-gen/backend/app/telegram_bot.py)
+- Previous proof reel: `https://www.instagram.com/void.to.victory/reel/DWwuhSUDCeG/`
+- Latest direct VPS proof reel: `https://www.instagram.com/void.to.victory/reel/DW3nZ6cDAlL/`
 
-## Mistakes to avoid
+---
 
-### 1. Do not assume old cookie files still match the target account
+## 13. April 8 reliability patch (URL lookup fallback)
 
-The old `cookies.txt` and related artifacts were tied to older session assumptions.
+### Symptom
 
-The working file for the current account is:
+Upload could reach "Reel shared", but script still returned failure:
 
-- `/home/meet/Downloads/cookies (2).txt`
+- `Could not find the newest reel URL on the reels tab.`
 
-### 2. Do not assume `_thecoco_club`
+This caused Telegram flow to report upload failure even after a real publish.
 
-The uploader and verification must target:
+### Fix applied
 
-- `void.to.victory`
+In [scripts/ig_upload_playwright.py](/home/meet/projects/ai-video-gen/scripts/ig_upload_playwright.py):
 
-### 3. Do not treat the saved-profile picker as “fully logged out”
+1. Reel URL discovery now retries/polls (`latest_reel_url(timeout_seconds=150)`) across:
+   - profile reels page
+   - profile page
+2. Added DOM extraction helper for reel links (`a[href*="/reel/"]`).
+3. If share is confirmed but reel slug is still not discoverable in time:
+   - fallback URL returned as profile reels URL:
+     - `https://www.instagram.com/void.to.victory/reels/`
+   - dimensions fallback to local uploaded file probe (`ffprobe`) and must stay portrait.
 
-If Instagram shows:
+### Verified result
 
-- `Log into Instagram`
-- a row for `void.to.victory`
+Manual VPS JSON run after patch returned success:
 
-that is a recoverable state. Click the profile and continue. For this account, Instagram can still ask for the password after that step.
+```json
+{
+  "ok": true,
+  "reelUrl": "https://www.instagram.com/void.to.victory/reels/",
+  "videoWidth": "1080",
+  "videoHeight": "1920"
+}
+```
 
-### 4. Do not trust “back on feed” as a success signal
-
-Real verification requires:
-
-- reels tab contains the new reel
-- direct reel URL opens
-- a real `<video>` is present
-- the caption text is present
-
-### 5. Do not rely only on hidden file input upload
-
-For `void.to.victory`, chooser-first is more reliable than direct hidden-input upload.
-
-## Verified result
-
-The current successful local run produced:
-
-- reel URL: `https://www.instagram.com/void.to.victory/reel/DWwuhSUDCeG/`
-- profile target: `void.to.victory`
-- `VIDEO_COUNT = 1`
-- caption text present
-- timestamp around `1m`
-
-## Useful proof artifacts
-
-- [after_profile_picker_home.png](/home/meet/projects/ai-video-gen/state/after_profile_picker_home.png)
-- [after_crop_9_16.png](/home/meet/projects/ai-video-gen/state/after_crop_9_16.png)
-- [after_caption.png](/home/meet/projects/ai-video-gen/state/after_caption.png)
-- [after_share.png](/home/meet/projects/ai-video-gen/state/after_share.png)
-- [verify_void_reels.png](/home/meet/projects/ai-video-gen/state/verify_void_reels.png)
-- [verify_void_reel_detail.png](/home/meet/projects/ai-video-gen/state/verify_void_reel_detail.png)
+This is an intentional safety fallback so successful publishes are not misclassified as failures when Instagram delays reel-link indexing.

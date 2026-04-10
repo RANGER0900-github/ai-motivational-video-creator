@@ -225,6 +225,23 @@ class Database:
                 """
             ).fetchall()
 
+    def claim_delivery(self, job_id: int) -> bool:
+        now = datetime.now(timezone.utc).isoformat()
+        with self.connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE jobs
+                SET delivery_status = 'sending',
+                    delivery_message = 'Sending to Telegram',
+                    updated_at = ?
+                WHERE id = ?
+                  AND status = 'completed'
+                  AND delivery_status IN ('pending', 'failed')
+                """,
+                (now, job_id),
+            )
+            return cursor.rowcount > 0
+
     def list_jobs_for_batch(self, batch_id: int):
         with self.connect() as conn:
             return conn.execute(

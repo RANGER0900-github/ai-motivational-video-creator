@@ -15,7 +15,8 @@ from .models import JobDetail
 logger = logging.getLogger(__name__)
 DEFAULT_QUOTA_LIMIT = 10_000
 DEFAULT_UPLOAD_COST = 1_600
-DESCRIPTION_VERSION = "v2"
+UPLOAD_RETRY_COOLDOWN_SECONDS = 300
+DESCRIPTION_VERSION = "v3"
 TITLE_POOL = [
     "Discipline Builds You | AI Motivation #Shorts #motivation",
     "Stay Locked In | AI Motivation #Shorts #discipline",
@@ -84,6 +85,18 @@ def utcnow_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def parse_utc_iso(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
 def pick_title(job_id: int, items: list[dict[str, Any]], quote: str = "") -> str:
     quote_text = quote.strip().strip('"')
     if quote_text:
@@ -109,6 +122,8 @@ def build_description(quote: str = "", author: str = "") -> str:
     intro_lines = [quote_text]
     if author_text:
         intro_lines.append(f"— {author_text}")
+    intro_lines.append("")
+    intro_lines.append("Save this short, share it, and come back when you need a reset.")
     intro_lines.append("")
     return "\n".join(intro_lines) + DEFAULT_DESCRIPTION
 
@@ -248,6 +263,7 @@ class YouTubeQueueStore:
                 "last_error": None,
                 "quota_cost": DEFAULT_UPLOAD_COST,
                 "renamed_yt_done": False,
+                "retry_disabled": False,
             }
             items.append(item)
             self._write(data)
@@ -268,10 +284,31 @@ class YouTubeQueueStore:
         blocked_until_at = data["quota"].get("quota_blocked_until_at")
         if blocked_until_at:
             return None
+        now = datetime.now(timezone.utc)
         for item in data["items"]:
-            if item.get("youtube_status") in {"pending", "failed"} and int(item.get("attempt_count", 0)) < self.config.youtube_retry_limit:
+            status = str(item.get("youtube_status") or "")
+            if status not in {"pending", "failed"}:
+                continue
+            if bool(item.get("retry_disabled")):
+                continue
+            if status == "failed":
+                last_attempt = parse_utc_iso(str(item.get("last_attempt_at") or ""))
+                if last_attempt is not None and (now - last_attempt).total_seconds() < UPLOAD_RETRY_COOLDOWN_SECONDS:
+                    continue
+            if bool(item.get("youtube_enabled_for_origin")) or int(item.get("attempt_count", 0)) < self.config.youtube_retry_limit:
                 return deepcopy(item)
         return None
+
+    def disable_retry(self, job_id: int, error: str) -> dict[str, Any]:
+        with self._lock:
+            data = self._refresh_quota_window(self._load_unlocked(), persist=False)
+            item = self._item_by_job_id(data, job_id)
+            item["youtube_status"] = "failed"
+            item["retry_disabled"] = True
+            item["youtube_enabled_for_origin"] = False
+            item["last_error"] = error[:500]
+            self._write(data)
+            return deepcopy(item)
 
     def mark_uploading(self, job_id: int) -> dict[str, Any]:
         with self._lock:

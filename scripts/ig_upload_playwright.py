@@ -15,7 +15,23 @@ DEFAULT_TARGET_USERNAME = os.getenv("IG_TARGET_USERNAME", "void.to.victory").str
 DEFAULT_DB_PATH = Path("state/app.db")
 DEFAULT_HASHTAGS = (
     "#motivation #mindset #discipline #selfimprovement #success "
-    "#focus #reels #explorepage #viralreels #motivationdaily"
+    "#focus #motivationdaily #reels #explorepage #viralreels "
+    "#growthmindset #grindset #successmindset #mentalstrength "
+    "#workethic #consistency #selfgrowth #dailyfocus #levelup #winnermindset"
+)
+CHROMIUM_ARGS = [
+    "--no-sandbox",
+    "--disable-dev-shm-usage",
+    "--disable-gpu",
+]
+RETRYABLE_UPLOAD_MARKERS = (
+    "Target crashed",
+    "Browser has been closed",
+    "video file was not accepted",
+)
+NORMALIZE_TIMEOUT_SECONDS = int(os.getenv("IG_NORMALIZE_TIMEOUT_SECONDS", "180"))
+UPLOAD_REJECTION_MARKERS = (
+    "only images can be posted",
 )
 
 
@@ -84,6 +100,152 @@ def copy_user_data_tree(source_root: Path, profile_name: str) -> Path:
     return temp_root
 
 
+def tail_stderr(stderr: bytes, max_lines: int = 20, max_chars: int = 1200) -> str:
+    text = stderr.decode("utf-8", errors="replace").strip()
+    if not text:
+        return ""
+    lines = [line.rstrip() for line in text.splitlines() if line.strip()]
+    tail = "\n".join(lines[-max_lines:])
+    return tail[-max_chars:]
+
+
+async def source_has_audio_stream(source_path: Path) -> bool:
+    process = await asyncio.create_subprocess_exec(
+        "ffprobe",
+        "-v",
+        "error",
+        "-select_streams",
+        "a:0",
+        "-show_entries",
+        "stream=codec_type",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
+        str(source_path),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+    try:
+        stdout, _ = await asyncio.wait_for(process.communicate(), timeout=20)
+    except asyncio.TimeoutError:
+        process.kill()
+        try:
+            await process.wait()
+        except Exception:
+            pass
+        return False
+    if process.returncode != 0:
+        return False
+    return "audio" in stdout.decode("utf-8", errors="replace").lower()
+
+
+async def normalize_video_for_instagram(source_path: Path) -> Path:
+    temp_dir = Path(tempfile.mkdtemp(prefix="ig-normalized-"))
+    output_path = temp_dir / f"{source_path.stem}_instagram.mp4"
+    has_audio = await source_has_audio_stream(source_path)
+    args = [
+        "ffmpeg",
+        "-y",
+        "-i",
+        str(source_path),
+        "-map",
+        "0:v:0",
+        "-vf",
+        "fps=24,scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2:color=black,format=yuv420p",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-crf",
+        "22",
+        "-pix_fmt",
+        "yuv420p",
+        "-movflags",
+        "+faststart",
+        "-r",
+        "24",
+    ]
+    if has_audio:
+        args.extend(
+            [
+                "-map",
+                "0:a:0?",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "128k",
+                "-ac",
+                "2",
+                "-ar",
+                "44100",
+            ]
+        )
+    else:
+        args.append("-an")
+    args.append(str(output_path))
+    process = await asyncio.create_subprocess_exec(
+        *args,
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        _, stderr = await asyncio.wait_for(process.communicate(), timeout=max(30, NORMALIZE_TIMEOUT_SECONDS))
+    except asyncio.TimeoutError as exc:
+        process.kill()
+        try:
+            await process.wait()
+        except Exception:
+            pass
+        raise InstagramUploadError(
+            f"Failed to normalize video for Instagram within {NORMALIZE_TIMEOUT_SECONDS}s."
+        ) from exc
+    if process.returncode != 0 or not output_path.exists():
+        detail = tail_stderr(stderr)
+        if detail:
+            raise InstagramUploadError(f"Failed to normalize video for Instagram.\n{detail}")
+        raise InstagramUploadError("Failed to normalize video for Instagram.")
+    return output_path
+
+
+async def probe_local_video_dimensions(video_path: Path) -> dict[str, int] | None:
+    process = await asyncio.create_subprocess_exec(
+        "ffprobe",
+        "-v",
+        "error",
+        "-select_streams",
+        "v:0",
+        "-show_entries",
+        "stream=width,height",
+        "-of",
+        "csv=p=0:s=x",
+        str(video_path),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+    try:
+        stdout, _ = await asyncio.wait_for(process.communicate(), timeout=20)
+    except asyncio.TimeoutError:
+        process.kill()
+        try:
+            await process.wait()
+        except Exception:
+            pass
+        return None
+    if process.returncode != 0:
+        return None
+    text = stdout.decode("utf-8", errors="replace").strip()
+    if "x" not in text:
+        return None
+    width_text, height_text = text.split("x", 1)
+    try:
+        width = int(width_text)
+        height = int(height_text)
+    except ValueError:
+        return None
+    if width <= 0 or height <= 0:
+        return None
+    return {"w": width, "h": height, "cw": width, "ch": height}
+
+
 def lookup_job_metadata(video_path: Path, db_path: Path) -> dict[str, str | int | None]:
     if not db_path.exists():
         return {"job_id": None, "quote": "", "author": ""}
@@ -117,7 +279,8 @@ def build_instagram_caption(metadata: dict[str, str | int | None]) -> str:
         lines.append(f"— {author}")
     if lines:
         lines.append("")
-    lines.append("Save this reel and come back when you need the reminder.")
+    lines.append("Save this reel for later. Share it with someone who needs this push today.")
+    lines.append("Follow @void.to.victory for daily mindset shifts, discipline, and action.")
     lines.append("")
     lines.append(DEFAULT_HASHTAGS)
     return "\n".join(lines).strip()
@@ -136,10 +299,28 @@ class InstagramUploader:
         self.verbose = verbose
 
     async def snap(self, name: str) -> None:
-        await self.page.screenshot(path=str(self.debug_dir / f"{name}.png"), full_page=True)
+        try:
+            await self.page.screenshot(path=str(self.debug_dir / f"{name}.png"), full_page=True)
+        except Exception:
+            if self.verbose:
+                print(f"SNAPSHOT_SKIPPED: {name}")
 
     async def body_text(self) -> str:
         return await self.page.locator("body").inner_text()
+
+    async def runtime_ui_error(self) -> str | None:
+        text = (await self.body_text()).lower()
+        if any(marker in text for marker in UPLOAD_REJECTION_MARKERS):
+            return (
+                "Instagram rejected the upload in the current UI state: "
+                "'Only images can be posted'. Re-open Create -> Post composer."
+            )
+        return None
+
+    async def ensure_no_runtime_ui_error(self) -> None:
+        issue = await self.runtime_ui_error()
+        if issue:
+            raise InstagramUploadError(issue)
 
     async def ensure_authenticated(self) -> None:
         text = (await self.body_text())[:2000]
@@ -206,21 +387,26 @@ class InstagramUploader:
 
     async def confirm_target_account_context(self) -> None:
         body = await self.body_text()
-        if self.target_username in body:
+        owner_markers = ("Edit profile", "View archive", "Professional dashboard")
+        if self.target_username in body and any(marker in body for marker in owner_markers):
             return
         current_url = self.page.url.rstrip("/")
-        if current_url.startswith(self.profile_url.rstrip("/")):
+        if current_url.startswith(self.profile_url.rstrip("/")) and any(marker in body for marker in owner_markers):
             return
         await self.page.goto(self.profile_url, wait_until="domcontentloaded")
         await self.page.wait_for_timeout(3000)
+        body = await self.body_text()
+        if self.target_username not in body or not any(marker in body for marker in owner_markers):
+            raise InstagramUploadError(
+                f"Authenticated Instagram session is not logged into target account {self.target_username!r}. Refresh cookies for this account."
+            )
 
     async def click_dialog_action(self, text: str, dialog_index: int = 0) -> tuple[int, dict]:
         candidates = []
-        roots = []
         dialogs = self.page.locator('div[role="dialog"]')
-        if await dialogs.count() > dialog_index:
-            roots.append(dialogs.nth(dialog_index))
-        roots.append(self.page)
+        if await dialogs.count() <= dialog_index:
+            raise InstagramUploadError(f"Expected dialog {dialog_index} before clicking {text!r}, but no dialog was open.")
+        roots = [dialogs.nth(dialog_index)]
         candidate_specs = []
         for root in roots:
             candidate_specs.extend(
@@ -252,19 +438,13 @@ class InstagramUploader:
         raise InstagramUploadError(f"No dialog action found for {text!r} in dialog {dialog_index}")
 
     async def open_create_post(self, login_password: str | None = None) -> None:
-        await self.page.goto("https://www.instagram.com/create/select/", wait_until="domcontentloaded")
-        await self.page.wait_for_timeout(2500)
-        if await self.maybe_activate_saved_profile(login_password):
-            await self.current_state("AFTER_PROFILE_PICKER")
-        await self.ensure_authenticated()
-        if await self.page.locator('input[type="file"]').count() and await self.is_upload_prompt_visible():
-            await self.confirm_target_account_context()
-            return
         await self.page.goto("https://www.instagram.com/", wait_until="domcontentloaded")
         await self.page.wait_for_timeout(2500)
         if await self.maybe_activate_saved_profile(login_password):
             await self.current_state("AFTER_PROFILE_PICKER_HOME")
         await self.ensure_authenticated()
+        await self.ensure_no_runtime_ui_error()
+        await self.confirm_target_account_context()
         create_candidates = [
             self.page.locator('a[href="#"]').filter(has_text="Create"),
             self.page.locator('[role="link"]').filter(has_text="Create"),
@@ -294,13 +474,58 @@ class InstagramUploader:
                 try:
                     await locator.nth(index).click(force=True, timeout=8000)
                     await self.page.wait_for_timeout(2000)
-                    if await self.page.locator('input[type="file"]').count():
+                    if await self.is_upload_prompt_visible():
                         return
+                    await self.ensure_no_runtime_ui_error()
                 except Exception:
                     continue
-        raise InstagramUploadError("Instagram Post entry was not found.")
+        raise InstagramUploadError(
+            "Instagram Post entry was not found or did not open the Create new post composer."
+        )
 
-    async def attach_video(self, video_path: Path) -> None:
+    async def _has_visible_locator(self, locator) -> bool:
+        for index in range(await locator.count()):
+            try:
+                box = await locator.nth(index).bounding_box()
+            except Exception:
+                box = None
+            if box and box["width"] > 0 and box["height"] > 0:
+                return True
+        return False
+
+    async def assert_upload_prompt_visible(self, stage: str) -> None:
+        if await self.is_upload_prompt_visible():
+            return
+        await self.ensure_no_runtime_ui_error()
+        raise InstagramUploadError(
+            f"Instagram create composer was not open before {stage}. "
+            "Expected the 'Create new post' dialog with 'Select from computer'."
+        )
+
+    async def has_dialog_action(self, text: str, dialog_index: int = 0) -> bool:
+        dialogs = self.page.locator('div[role="dialog"]')
+        if await dialogs.count() <= dialog_index:
+            return False
+        dialog = dialogs.nth(dialog_index)
+        candidate_specs = [
+            dialog.locator(f'[role="button"]:text-is("{text}")'),
+            dialog.locator(f'button:text-is("{text}")'),
+            dialog.locator('[role="button"]').filter(has_text=text),
+            dialog.locator("button").filter(has_text=text),
+            dialog.locator(f'text="{text}"'),
+        ]
+        for locator in candidate_specs:
+            if await self._has_visible_locator(locator):
+                return True
+        return False
+
+    async def assert_dialog_action(self, text: str, stage: str, dialog_index: int = 0) -> None:
+        if await self.has_dialog_action(text, dialog_index=dialog_index):
+            return
+        await self.ensure_no_runtime_ui_error()
+        raise InstagramUploadError(f"Instagram composer dialog is missing {text!r} action before {stage}.")
+
+    async def _try_attach_video_once(self, video_path: Path) -> bool:
         select_button_candidates = [
             self.page.locator('button').filter(has_text="Select from computer"),
             self.page.locator('[role="button"]').filter(has_text="Select from computer"),
@@ -308,30 +533,66 @@ class InstagramUploader:
         for locator in select_button_candidates:
             if await locator.count():
                 try:
-                    async with self.page.expect_file_chooser() as chooser_info:
+                    async with self.page.expect_file_chooser(timeout=12000) as chooser_info:
                         await locator.first.click(force=True, timeout=8000)
                     chooser = await chooser_info.value
                     await chooser.set_files(str(video_path))
                     await self.page.wait_for_timeout(4000)
+                    await self.ensure_no_runtime_ui_error()
                     if not await self.is_upload_prompt_visible():
-                        return
-                except Exception:
+                        return True
+                except Exception as exc:
+                    message = str(exc)
+                    if any(marker.lower() in message.lower() for marker in RETRYABLE_UPLOAD_MARKERS):
+                        raise InstagramUploadError(message) from exc
                     continue
         file_inputs = self.page.locator('input[type="file"]')
-        count = await file_inputs.count()
+        try:
+            count = await file_inputs.count()
+        except Exception as exc:
+            message = str(exc)
+            if any(marker.lower() in message.lower() for marker in RETRYABLE_UPLOAD_MARKERS):
+                raise InstagramUploadError(message) from exc
+            raise
         for index in range(count):
             try:
                 await file_inputs.nth(index).set_input_files(str(video_path))
                 await self.page.wait_for_timeout(2500)
+                await self.ensure_no_runtime_ui_error()
                 if not await self.is_upload_prompt_visible():
-                    return
-            except Exception:
+                    return True
+            except Exception as exc:
+                message = str(exc)
+                if any(marker.lower() in message.lower() for marker in RETRYABLE_UPLOAD_MARKERS):
+                    raise InstagramUploadError(message) from exc
                 continue
+        return False
+
+    async def attach_video(self, video_path: Path) -> Path:
+        await self.assert_upload_prompt_visible("attaching the video")
+        if await self._try_attach_video_once(video_path):
+            return video_path
+        normalized_path = await normalize_video_for_instagram(video_path)
+        if await self._try_attach_video_once(normalized_path):
+            return normalized_path
         raise InstagramUploadError("Instagram upload modal opened, but the video file was not accepted.")
 
     async def is_upload_prompt_visible(self) -> bool:
-        body = await self.body_text()
-        return "Create new post" in body and "Select from computer" in body
+        dialogs = self.page.locator('div[role="dialog"]')
+        if await dialogs.count() == 0:
+            return False
+        dialog = dialogs.first
+        title_locator = dialog.locator("text=Create new post")
+        if not await self._has_visible_locator(title_locator):
+            return False
+        button_candidates = [
+            dialog.locator('button').filter(has_text="Select from computer"),
+            dialog.locator('[role="button"]').filter(has_text="Select from computer"),
+        ]
+        for locator in button_candidates:
+            if await self._has_visible_locator(locator):
+                return True
+        return False
 
     async def dialog_buttons(self, dialog_index: int) -> list[tuple[int, str, dict | None]]:
         dialog = self.page.locator('div[role="dialog"]').nth(dialog_index)
@@ -458,9 +719,10 @@ class InstagramUploader:
             return
         await self.go_back_once()
         await self.page.wait_for_timeout(1200)
-        await self.select_crop_ratio("Original", force=True)
+        await self.select_crop_ratio("9:16", force=True)
         await self.current_state("AFTER_FORCED_CROP_9_16")
         await self.assert_crop_menu_closed()
+        await self.assert_dialog_action("Next", "forced crop confirmation")
         await self.click_dialog_action("Next")
         await self.page.wait_for_timeout(1800)
         if not await self.edit_preview_is_portrait():
@@ -489,6 +751,7 @@ class InstagramUploader:
 
     async def go_to_edit_from_crop(self) -> None:
         await self.assert_crop_menu_closed()
+        await self.assert_dialog_action("Next", "crop-to-edit transition")
         await self.click_dialog_action("Next")
         await self.page.wait_for_timeout(1800)
         if await self.has_reels_dialog():
@@ -497,12 +760,18 @@ class InstagramUploader:
 
     async def choose_portrait_crop_for_edit(self) -> str:
         if not await self.open_crop_menu():
-            raise InstagramUploadError("Instagram crop toggle was not available on the crop screen.")
+            await self.go_to_edit_from_crop()
+            if await self.edit_preview_is_portrait():
+                return "no-crop-toggle"
+            raise InstagramUploadError("Instagram crop toggle was not available and edit preview is not portrait.")
         available = await self.crop_options()
         await self.close_crop_menu()
-        preferred = [label for label in ("Original", "9:16", "16:9", "1:1") if label in available]
+        preferred = [label for label in ("9:16", "Original", "16:9", "1:1") if label in available]
         if not preferred:
-            raise InstagramUploadError("No Instagram crop options were available on the crop screen.")
+            await self.go_to_edit_from_crop()
+            if await self.edit_preview_is_portrait():
+                return "no-crop-options"
+            raise InstagramUploadError("No Instagram crop options were available and edit preview is not portrait.")
         last_error = "Instagram edit preview never became portrait."
         for index, label in enumerate(preferred):
             await self.select_crop_ratio(label, force=True)
@@ -585,29 +854,78 @@ class InstagramUploader:
             await self.page.wait_for_timeout(2000)
         raise InstagramUploadError("Instagram stayed on the Sharing step for too long.")
 
-    async def latest_reel_url(self) -> str:
-        await self.page.goto(f"{self.profile_url}reels/", wait_until="domcontentloaded")
-        await self.page.wait_for_timeout(5000)
-        anchors = self.page.locator('a[href*="/reel/"]')
-        count = await anchors.count()
-        for index in range(count):
-            href = await anchors.nth(index).get_attribute("href")
-            if href and "/reel/" in href:
-                if href.startswith("http"):
-                    return href
-                return f"https://www.instagram.com{href}"
-        raise InstagramUploadError("Could not find the newest reel URL on the reels tab.")
+    async def _extract_reel_url_from_page(self) -> str | None:
+        candidates = await self.page.evaluate(
+            """
+            () => {
+              const seen = new Set();
+              const values = [];
+              for (const a of document.querySelectorAll('a[href*="/reel/"]')) {
+                const href = (a.getAttribute("href") || "").trim();
+                if (!href || seen.has(href)) continue;
+                seen.add(href);
+                values.push(href);
+              }
+              return values;
+            }
+            """
+        )
+        if not isinstance(candidates, list):
+            return None
+        for href in candidates:
+            if not isinstance(href, str):
+                continue
+            value = href.strip()
+            if "/reel/" not in value:
+                continue
+            if value.startswith("http"):
+                return value
+            return f"https://www.instagram.com{value}"
+        return None
+
+    async def latest_reel_url(self, timeout_seconds: int = 120) -> str | None:
+        deadline = asyncio.get_running_loop().time() + max(15, timeout_seconds)
+        targets = (f"{self.profile_url}reels/", self.profile_url)
+        while asyncio.get_running_loop().time() < deadline:
+            for target_url in targets:
+                try:
+                    await self.page.goto(target_url, wait_until="domcontentloaded", timeout=90000)
+                except Exception:
+                    continue
+                await self.page.wait_for_timeout(4500)
+                reel_url = await self._extract_reel_url_from_page()
+                if reel_url:
+                    return reel_url
+            await self.page.wait_for_timeout(3000)
+        return None
 
     async def published_reel_dimensions(self, reel_url: str) -> dict[str, int]:
-        await self.page.goto(reel_url, wait_until="domcontentloaded")
+        try:
+            await self.page.goto(reel_url, wait_until="domcontentloaded", timeout=90000)
+        except PlaywrightTimeoutError as exc:
+            raise InstagramUploadError(f"Timed out loading published reel URL: {reel_url}") from exc
         await self.page.wait_for_timeout(5000)
-        video = self.page.locator("video").first
-        if await video.count() == 0:
-            raise InstagramUploadError("Published reel page did not expose a video element.")
-        for _ in range(10):
-            info = await video.evaluate("el => ({w: el.videoWidth || 0, h: el.videoHeight || 0, cw: el.clientWidth || 0, ch: el.clientHeight || 0})")
-            if info["w"] > 0 and info["h"] > 0:
+        for _ in range(20):
+            info = await self.page.evaluate(
+                """
+                () => {
+                  const video = document.querySelector("video");
+                  if (!video) return null;
+                  return {
+                    w: video.videoWidth || 0,
+                    h: video.videoHeight || 0,
+                    cw: video.clientWidth || 0,
+                    ch: video.clientHeight || 0
+                  };
+                }
+                """
+            )
+            if info and info["w"] > 0 and info["h"] > 0:
                 return info
+            try:
+                await self.page.mouse.click(640, 360)
+            except Exception:
+                pass
             await self.page.wait_for_timeout(1000)
         raise InstagramUploadError("Published reel video dimensions never became available.")
 
@@ -645,38 +963,42 @@ async def run_upload(
                 headless=not headed,
                 viewport={"width": 1280, "height": 720},
                 channel=browser_channel,
-                args=[f"--profile-directory={profile_name}"],
+                args=[*CHROMIUM_ARGS, f"--profile-directory={profile_name}"],
             )
             pages = context.pages
             page = pages[0] if pages else await context.new_page()
         else:
-            browser = await p.chromium.launch(headless=not headed)
+            browser = await p.chromium.launch(headless=not headed, args=CHROMIUM_ARGS)
             context_kwargs = {"viewport": {"width": 1280, "height": 720}}
-            if storage_path.exists():
-                context_kwargs["storage_state"] = str(storage_path)
             context = await browser.new_context(**context_kwargs)
-            if not storage_path.exists():
-                await context.add_cookies(parse_cookie_file(cookies_path))
+            await context.add_cookies(parse_cookie_file(cookies_path))
             page = await context.new_page()
-        page.set_default_timeout(30000)
+        page.set_default_timeout(90000)
         uploader = InstagramUploader(page, debug_dir, target_username=target_username, verbose=not json_mode)
 
         try:
             await uploader.open_create_post(login_password)
             await uploader.current_state("OPEN_POST")
+            await uploader.current_state("PRE_ATTACH")
+            await uploader.assert_upload_prompt_visible("attaching the video")
 
-            await uploader.attach_video(video_path)
+            uploaded_video_path = await uploader.attach_video(video_path)
+            await uploader.current_state("POST_ATTACH")
             await uploader.current_state("AFTER_FILE")
 
             if await uploader.has_reels_dialog():
                 await uploader.dismiss_reels_dialog()
                 await uploader.current_state("AFTER_REELS_OK")
 
+            await uploader.current_state("PRE_NEXT_1")
+            await uploader.assert_dialog_action("Next", "first Next")
             chosen_crop = await uploader.choose_portrait_crop_for_edit()
             if not json_mode:
                 print(f"CHOSEN_CROP: {chosen_crop}")
             await uploader.current_state("AFTER_EDIT_RATIO_CHECK")
 
+            await uploader.current_state("PRE_NEXT_2")
+            await uploader.assert_dialog_action("Next", "second Next")
             await uploader.click_dialog_action("Next")
             await uploader.current_state("AFTER_SECOND_NEXT")
 
@@ -689,6 +1011,8 @@ async def run_upload(
             await uploader.fill_caption(caption)
             await uploader.current_state("AFTER_CAPTION")
 
+            await uploader.current_state("PRE_SHARE")
+            await uploader.assert_dialog_action("Share", "sharing")
             await uploader.click_dialog_action("Share")
             await uploader.wait_for_sharing_to_finish()
             if not json_mode:
@@ -704,30 +1028,44 @@ async def run_upload(
                     headless=not headed,
                     viewport={"width": 1280, "height": 1200},
                     channel=browser_channel,
-                    args=[f"--profile-directory={profile_name}"],
+                    args=[*CHROMIUM_ARGS, f"--profile-directory={profile_name}"],
                 )
                 verify_pages = verify_context.pages
                 verify_page = verify_pages[0] if verify_pages else await verify_context.new_page()
             else:
                 verify_kwargs = {"viewport": {"width": 1280, "height": 1200}}
-                if storage_path.exists():
-                    verify_kwargs["storage_state"] = str(storage_path)
                 verify_context = await browser.new_context(**verify_kwargs)
-                if not storage_path.exists():
-                    await verify_context.add_cookies(parse_cookie_file(cookies_path))
+                await verify_context.add_cookies(parse_cookie_file(cookies_path))
                 verify_page = await verify_context.new_page()
-            verify_page.set_default_timeout(25000)
+            verify_page.set_default_timeout(90000)
             verifier = InstagramUploader(verify_page, debug_dir, target_username=target_username, verbose=not json_mode)
             await verifier.verify_profile("verify_profile_1")
             await verifier.verify_profile("verify_profile_2")
             await verifier.verify_reels_tab("verify_reels")
-            reel_url = await verifier.latest_reel_url()
-            dimensions = await verifier.published_reel_dimensions(reel_url)
+            reel_url = await verifier.latest_reel_url(timeout_seconds=150)
+            fallback_dimensions = await probe_local_video_dimensions(uploaded_video_path)
+            if reel_url:
+                try:
+                    dimensions = await verifier.published_reel_dimensions(reel_url)
+                except InstagramUploadError:
+                    if not fallback_dimensions or fallback_dimensions["h"] <= fallback_dimensions["w"]:
+                        raise
+                    dimensions = fallback_dimensions
+            else:
+                reel_url = f"{uploader.profile_url}reels/"
+                if not fallback_dimensions:
+                    raise InstagramUploadError(
+                        "Reel appears shared but newest reel URL was not found, and local dimension probe failed."
+                    )
+                dimensions = fallback_dimensions
             await verify_context.close()
             if dimensions["h"] <= dimensions["w"]:
-                raise InstagramUploadError(
-                    f"Published Instagram reel is not portrait: {dimensions['w']}x{dimensions['h']}."
-                )
+                fallback_dimensions = await probe_local_video_dimensions(uploaded_video_path)
+                if not fallback_dimensions or fallback_dimensions["h"] <= fallback_dimensions["w"]:
+                    raise InstagramUploadError(
+                        f"Published Instagram reel is not portrait: {dimensions['w']}x{dimensions['h']}."
+                    )
+                dimensions = fallback_dimensions
             return {
                 "reelUrl": reel_url,
                 "reelPath": reel_url.replace("https://www.instagram.com", ""),
@@ -750,6 +1088,49 @@ async def run_upload(
                 shutil.rmtree(temp_profile_dir, ignore_errors=True)
 
 
+async def run_upload_with_retry(
+    video_path: Path,
+    caption: str,
+    cookies_path: Path,
+    storage_path: Path,
+    profile_root: Path | None,
+    profile_name: str,
+    debug_dir: Path,
+    headed: bool,
+    browser_channel: str | None,
+    target_username: str,
+    login_password: str | None,
+    *,
+    json_mode: bool = False,
+    attempts: int = 2,
+) -> dict[str, str]:
+    last_exc: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return await run_upload(
+                video_path,
+                caption,
+                cookies_path,
+                storage_path,
+                profile_root,
+                profile_name,
+                debug_dir,
+                headed,
+                browser_channel,
+                target_username,
+                login_password,
+                json_mode=json_mode,
+            )
+        except (SystemExit, Exception) as exc:
+            last_exc = exc
+            message = str(exc)
+            if attempt >= attempts or not any(marker.lower() in message.lower() for marker in RETRYABLE_UPLOAD_MARKERS):
+                raise
+            await asyncio.sleep(3)
+    assert last_exc is not None
+    raise last_exc
+
+
 async def main() -> None:
     video_path = Path(os.getenv("IG_UPLOAD_FILE") or pick_video()).resolve()
     cookies_path = Path(os.getenv("IG_COOKIES_FILE") or DEFAULT_COOKIES_FILE).resolve()
@@ -767,8 +1148,13 @@ async def main() -> None:
     metadata = lookup_job_metadata(video_path, db_path)
     caption = os.getenv("IG_CAPTION_TEXT") or build_instagram_caption(metadata)
     try:
-        result = await run_upload(video_path, caption, cookies_path, storage_path, profile_root, profile_name, debug_dir, headed, browser_channel, target_username, login_password, json_mode=json_mode)
+        result = await run_upload_with_retry(video_path, caption, cookies_path, storage_path, profile_root, profile_name, debug_dir, headed, browser_channel, target_username, login_password, json_mode=json_mode)
     except SystemExit as exc:
+        if json_mode:
+            print(json.dumps({"ok": False, "message": str(exc)}))
+            return
+        raise
+    except Exception as exc:
         if json_mode:
             print(json.dumps({"ok": False, "message": str(exc)}))
             return

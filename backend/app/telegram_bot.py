@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import atexit
 import asyncio
+import errno
 import html
 import logging
+import os
 from contextlib import suppress
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import fcntl
 from telegram import (
     BotCommand,
     BotCommandScopeAllPrivateChats,
@@ -50,11 +54,13 @@ from .youtube import (
     YouTubeQuotaExceeded,
     YouTubeUploadError,
     build_description,
+    pick_title,
     rename_uploaded_file,
     upload_with_node,
 )
 
 logger = logging.getLogger(__name__)
+_INSTANCE_LOCK_HANDLE = None
 
 PAGE_SIZE = 5
 COUNT_PRESETS = (1, 3, 5, 10)
@@ -86,6 +92,8 @@ class TelegramBotRuntime:
         self.instagram_queue = InstagramQueueStore(config)
         self._youtube_upload_task: asyncio.Task | None = None
         self._instagram_upload_task: asyncio.Task | None = None
+        self._instagram_upload_job_id: int | None = None
+        self._instagram_upload_started_at: datetime | None = None
 
     async def post_init(self, application: Application) -> None:
         if not self.config.telegram_bot_token:
@@ -94,8 +102,9 @@ class TelegramBotRuntime:
             raise RuntimeError("AI_VIDEO_GEN_ALLOWED_CHAT_IDS is not configured")
         self.quotes.normalize()
         self.job_service.start()
+        self.instagram_queue.recover_stale_state()
         self.db.update_bot_state(last_startup_at=utcnow_iso())
-        await application.bot.delete_webhook(drop_pending_updates=False)
+        await application.bot.delete_webhook(drop_pending_updates=True)
         await application.bot.set_my_commands(
             commands=[
                 BotCommand("start", "Open the control panel"),
@@ -124,9 +133,9 @@ class TelegramBotRuntime:
             self._instagram_upload_task.cancel()
             with suppress(asyncio.CancelledError):
                 await self._instagram_upload_task
-        for _, action_task in self._chat_action_tasks.values():
+        for action, action_task in self._chat_action_tasks.values():
             action_task.cancel()
-        for _, action_task in self._chat_action_tasks.values():
+        for action, action_task in self._chat_action_tasks.values():
             with suppress(asyncio.CancelledError):
                 await action_task
         self._chat_action_tasks.clear()
@@ -222,10 +231,25 @@ class TelegramBotRuntime:
             platforms.append("Instagram")
         return ", ".join(platforms) if platforms else "None"
 
+    def _instagram_stale_after_seconds(self) -> int:
+        configured_timeout = max(60, int(self.config.instagram_upload_timeout_seconds))
+        return configured_timeout + 180
+
+    async def _send_logged_message(self, bot, reason: str, **kwargs):
+        logger.info(
+            "Sending Telegram text message: reason=%s chat_id=%s reply_to=%s",
+            reason,
+            kwargs.get("chat_id"),
+            kwargs.get("reply_to_message_id"),
+        )
+        return await bot.send_message(**kwargs)
+
     async def _background_loop(self, application: Application) -> None:
         while True:
             try:
                 await self._tick(application)
+            except asyncio.CancelledError:
+                raise
             except Exception:
                 logger.exception("Background loop tick failed")
             await asyncio.sleep(3)
@@ -253,11 +277,26 @@ class TelegramBotRuntime:
         )
 
     async def _maybe_process_instagram_queue(self, application: Application) -> None:
+        stale_after_seconds = self._instagram_stale_after_seconds()
+        stale_jobs = self.instagram_queue.recover_stalled_uploading(stale_after_seconds)
+        for stale_job_id in stale_jobs:
+            logger.warning("Recovered stale Instagram queue item: job_id=%s", stale_job_id)
         if self._instagram_upload_task is not None and not self._instagram_upload_task.done():
+            if self._instagram_upload_started_at is not None:
+                age_seconds = (datetime.now(timezone.utc) - self._instagram_upload_started_at).total_seconds()
+                if age_seconds > stale_after_seconds:
+                    logger.error(
+                        "Canceling stale Instagram upload task: job_id=%s age_seconds=%s",
+                        self._instagram_upload_job_id,
+                        int(age_seconds),
+                    )
+                    self._instagram_upload_task.cancel()
             return
         item = self.instagram_queue.next_ready_item()
         if item is None:
             return
+        self._instagram_upload_job_id = int(item["job_id"])
+        self._instagram_upload_started_at = datetime.now(timezone.utc)
         self._instagram_upload_task = asyncio.create_task(
             self._upload_queued_instagram(application, item["job_id"]),
             name=f"instagram-upload-{item['job_id']}",
@@ -289,7 +328,7 @@ class TelegramBotRuntime:
                 new_output_path=new_output_path,
                 renamed_yt_done=renamed,
             )
-            if job.chat_id is not None:
+            if job.chat_id is not None and not self._should_suppress_loop_platform_success(job):
                 await application.bot.send_message(
                     chat_id=job.chat_id,
                     text=self._youtube_success_text(queue_item),
@@ -302,7 +341,9 @@ class TelegramBotRuntime:
             chat_id = item.get("chat_id")
             if chat_id and (before or {}).get("youtube_status") != "quota_blocked":
                 summary = self.youtube_queue.status_summary()
-                await application.bot.send_message(
+                await self._send_logged_message(
+                    application.bot,
+                    "youtube_quota_blocked",
                     chat_id=chat_id,
                     text=(
                         "⚠️ <b>YouTube uploads are blocked for 24 hours</b>\n"
@@ -310,11 +351,16 @@ class TelegramBotRuntime:
                     ),
                     parse_mode=ParseMode.HTML,
                 )
+        except FileNotFoundError as exc:
+            self.youtube_queue.disable_retry(job_id, str(exc))
+            logger.warning("Disabled YouTube retry for missing output: job_id=%s error=%s", job_id, exc)
         except Exception as exc:
             item = self.youtube_queue.mark_failed(job_id, str(exc), quota_exceeded=False)
             chat_id = item.get("chat_id")
-            if chat_id:
-                await application.bot.send_message(
+            if chat_id and not self._should_suppress_loop_retry_notice(job):
+                await self._send_logged_message(
+                    application.bot,
+                    "youtube_upload_failed",
                     chat_id=chat_id,
                     text=(
                         "⚠️ <b>YouTube upload failed</b>\n"
@@ -327,6 +373,8 @@ class TelegramBotRuntime:
             self._youtube_upload_task = None
 
     async def _upload_queued_instagram(self, application: Application, job_id: int) -> None:
+        was_blocked = self.instagram_queue.status_summary().get("blocked", False)
+        logger.info("Starting Instagram upload worker for job_id=%s", job_id)
         try:
             item = self.instagram_queue.mark_uploading(job_id)
             job = self.job_service.get_job(job_id)
@@ -335,43 +383,72 @@ class TelegramBotRuntime:
             output_path = self.config.root_dir / job.output_path
             if not output_path.exists():
                 raise FileNotFoundError(f"Output file missing for job #{job_id}: {output_path}")
+            if job.chat_id is not None and self._should_send_instagram_started_notice(item):
+                await self._send_logged_message(
+                    application.bot,
+                    "instagram_upload_started",
+                    chat_id=job.chat_id,
+                    text=(
+                        "📸 <b>Instagram upload started</b>\n"
+                        "This can take a few minutes on the VPS. I will send the final Instagram URL after publish."
+                    ),
+                    parse_mode=ParseMode.HTML,
+                    reply_to_message_id=job.telegram_message_id,
+                )
             result = await upload_to_instagram(
                 self.config,
                 video_path=output_path,
                 caption=str(item.get("caption") or ""),
             )
             queue_item = self.instagram_queue.mark_uploaded(job.id, result=result)
-            if job.chat_id is not None:
+            if job.chat_id is not None and not self._should_suppress_loop_platform_success(job):
                 await application.bot.send_message(
                     chat_id=job.chat_id,
                     text=self._instagram_success_text(queue_item),
                     parse_mode=ParseMode.HTML,
                     reply_to_message_id=job.telegram_message_id,
                 )
+            logger.info("Completed Instagram upload worker for job_id=%s", job_id)
+        except asyncio.CancelledError:
+            logger.warning("Instagram upload worker canceled for job_id=%s", job_id)
+            try:
+                self.instagram_queue.mark_failed(job_id, "Instagram upload worker canceled by watchdog.", blocked_reason=None)
+            except Exception:
+                logger.exception("Failed to mark Instagram queue item canceled for job_id=%s", job_id)
+            raise
         except Exception as exc:
-            auth_blocked = "not authenticated on this server" in str(exc).lower()
-            item = self.instagram_queue.mark_failed(job_id, str(exc), auth_blocked=auth_blocked)
+            blocked_reason = self._instagram_block_reason(str(exc))
+            item = self.instagram_queue.mark_failed(job_id, str(exc), blocked_reason=blocked_reason)
+            logger.exception("Instagram upload worker failed for job_id=%s", job_id)
             chat_id = item.get("chat_id")
             if chat_id:
-                await application.bot.send_message(
-                    chat_id=chat_id,
-                    text=(
-                        (
-                            "⏳ <b>Instagram session is not authenticated on the VPS</b>\n"
-                            "Refresh the VPS Instagram cookies or storage before retrying uploads.\n"
+                if blocked_reason:
+                    if not was_blocked:
+                        await self._send_logged_message(
+                            application.bot,
+                            "instagram_blocked",
+                            chat_id=chat_id,
+                            text=self._instagram_block_text(blocked_reason, str(exc)),
+                            parse_mode=ParseMode.HTML,
+                            reply_to_message_id=item.get("telegram_message_id"),
                         )
-                        if auth_blocked
-                        else (
+                elif not self._should_suppress_loop_retry_notice(job):
+                    await self._send_logged_message(
+                        application.bot,
+                        "instagram_upload_failed",
+                        chat_id=chat_id,
+                        text=(
                             "⚠️ <b>Instagram upload failed</b>\n"
                             f"Job #{job_id} is still queued for retry.\n"
-                        )
+                            f"<code>{html.escape(str(exc)[:300])}</code>"
+                        ),
+                        parse_mode=ParseMode.HTML,
+                        reply_to_message_id=item.get("telegram_message_id"),
                     )
-                    + f"<code>{html.escape(str(exc)[:300])}</code>",
-                    parse_mode=ParseMode.HTML,
-                    reply_to_message_id=item.get("telegram_message_id"),
-                )
         finally:
             self._instagram_upload_task = None
+            self._instagram_upload_job_id = None
+            self._instagram_upload_started_at = None
 
     def _youtube_success_text(self, item: dict[str, object]) -> str:
         title = html.escape(str(item.get("title", "")))
@@ -402,14 +479,13 @@ class TelegramBotRuntime:
 
     def _instagram_success_text(self, item: dict[str, object]) -> str:
         url = html.escape(str(item.get("instagram_url", "")))
-        return "\n".join(
-            [
-                "📸 <b>Uploaded to Instagram</b>",
-                "",
-                "🔗 <b>Instagram URL:</b>",
-                url,
-            ]
-        )
+        width = item.get("video_width")
+        height = item.get("video_height")
+        lines = ["📸 <b>Uploaded to Instagram</b>", ""]
+        if width and height:
+            lines.extend([f"📐 <b>Verified:</b> {width}x{height}", ""])
+        lines.extend(["🔗 <b>Instagram URL:</b>", url])
+        return "\n".join(lines)
 
     def _instagram_queue_text(self, item: dict[str, object]) -> str:
         status = str(item.get("instagram_status", "pending"))
@@ -417,12 +493,69 @@ class TelegramBotRuntime:
             return self._instagram_success_text(item)
         if status == "uploading":
             return "📸 <b>Instagram upload in progress</b>\nYour reel is being published now."
-        if status == "auth_blocked":
-            return "⏳ <b>Instagram is blocked on this VPS</b>\nRefresh the VPS Instagram session before retrying uploads."
+        if status in {"blocked", "auth_blocked"}:
+            return self._instagram_block_text(
+                str(self.instagram_queue.status_summary().get("blocked_reason") or "unknown"),
+                str(item.get("last_error", "Instagram uploads are blocked on this VPS.")),
+            )
         if status == "failed":
             detail = html.escape(str(item.get("last_error", "Previous upload failed")))
             return f"⚠️ <b>Instagram upload will retry</b>\n<code>{detail[:300]}</code>"
         return "📸 <b>Added to Instagram queue</b>\nYour reel will upload automatically."
+
+    def _instagram_block_reason(self, message: str) -> str | None:
+        lowered = message.lower()
+        if "not authenticated on this server" in lowered:
+            return "auth"
+        if "playwright install" in lowered or "browsertype.launch" in lowered or "executable doesn't exist" in lowered:
+            return "runtime"
+        if "only images can be posted" in lowered:
+            return "runtime"
+        if "create composer was not open" in lowered or "composer dialog is missing" in lowered:
+            return "runtime"
+        if "post entry was not found" in lowered or "create entry was not found" in lowered:
+            return "runtime"
+        if "no dialog action found" in lowered:
+            return "runtime"
+        if "not portrait" in lowered:
+            return "ratio"
+        return None
+
+    def _instagram_block_text(self, reason: str, error_text: str) -> str:
+        detail = f"<code>{html.escape(error_text[:300])}</code>"
+        if reason == "auth":
+            title = "⏳ <b>Instagram session is not authenticated on the VPS</b>"
+            body = "Refresh the VPS Instagram cookies or storage before retrying uploads."
+        elif reason == "runtime":
+            title = "🛠️ <b>Instagram publishing is blocked on this VPS</b>"
+            body = (
+                "Instagram web UI state is unstable on the VPS. "
+                "Review state/open_post.png, state/pre_attach.png, and state/failed_state.png, then retry."
+            )
+        elif reason == "ratio":
+            title = "📐 <b>Instagram publishing is paused</b>"
+            body = "The VPS published a non-portrait reel, so uploads were blocked to avoid bad posts."
+        else:
+            title = "⏳ <b>Instagram uploads are blocked on this VPS</b>"
+            body = "Fix the VPS Instagram runtime before retrying uploads."
+        return f"{title}\n{body}\n{detail}"
+
+    def _should_suppress_loop_platform_success(self, job: JobDetail) -> bool:
+        if job.origin != "loop":
+            return False
+        state = self.bot_state()
+        return bool(state.loop_telegram_enabled)
+
+    def _should_suppress_loop_retry_notice(self, job: JobDetail) -> bool:
+        if job.origin != "loop":
+            return False
+        state = self.bot_state()
+        return bool(state.loop_telegram_enabled)
+
+    def _should_send_instagram_started_notice(self, item: dict[str, object]) -> bool:
+        if not bool(item.get("instagram_enabled_for_origin")):
+            return True
+        return int(item.get("attempt_count") or 0) <= 1
 
     def _publish_upload_markup(self, job: JobDetail) -> InlineKeyboardMarkup | None:
         if job.status != "completed" or not job.output_path:
@@ -479,6 +612,8 @@ class TelegramBotRuntime:
         while True:
             try:
                 await application.bot.send_chat_action(chat_id=chat_id, action=action)
+            except asyncio.CancelledError:
+                raise
             except Exception:
                 logger.exception("Failed to send chat action %s to %s", action, chat_id)
             await asyncio.sleep(4)
@@ -500,16 +635,51 @@ class TelegramBotRuntime:
         self.job_service.create_jobs(CreateJobRequest(), origin="loop", chat_id=state.loop_chat_id)
 
     def _loop_publications_pending(self) -> bool:
-        loop_job_ids = {job.id for job in self.job_service.list_jobs() if job.origin == "loop"}
-        if not loop_job_ids:
-            return False
-        for item in self.youtube_queue.snapshot().get("items", []):
-            if int(item.get("job_id", 0)) in loop_job_ids and str(item.get("youtube_status")) == "uploading":
-                return True
-        for item in self.instagram_queue.load().get("items", []):
-            if int(item.get("job_id", 0)) in loop_job_ids and str(item.get("instagram_status")) == "uploading":
+        state = self.bot_state()
+        for job in self.job_service.list_jobs():
+            if job.origin != "loop" or job.status != "completed":
+                continue
+            if not self._loop_job_ready_for_telegram(job, state):
                 return True
         return False
+
+    def _loop_job_targets(
+        self,
+        job: JobDetail,
+        state,
+    ) -> tuple[bool, bool, bool, dict[str, object] | None, dict[str, object] | None]:
+        youtube_item = self.youtube_queue.get_item(job.id)
+        instagram_item = self.instagram_queue.get_item(job.id)
+        youtube_selected = youtube_item is not None or (
+            job.delivery_status in {"pending", "failed"} and bool(state.loop_youtube_enabled)
+        )
+        instagram_selected = instagram_item is not None or (
+            job.delivery_status in {"pending", "failed"} and bool(state.loop_instagram_enabled)
+        )
+        telegram_selected = job.delivery_status != "skipped" and bool(state.loop_telegram_enabled)
+        return telegram_selected, youtube_selected, instagram_selected, youtube_item, instagram_item
+
+    def _ensure_loop_publication_jobs(
+        self,
+        job: JobDetail,
+        state,
+    ) -> tuple[dict[str, object] | None, dict[str, object] | None]:
+        _, youtube_selected, instagram_selected, youtube_item, instagram_item = self._loop_job_targets(job, state)
+        if youtube_selected and youtube_item is None:
+            youtube_item = self.youtube_queue.enqueue_loop_job(job)
+        if instagram_selected and instagram_item is None:
+            instagram_item = self.instagram_queue.enqueue_job(job, instagram_enabled_for_origin=True)
+        return youtube_item, instagram_item
+
+    def _loop_job_ready_for_telegram(self, job: JobDetail, state) -> bool:
+        telegram_selected, youtube_selected, instagram_selected, youtube_item, instagram_item = self._loop_job_targets(job, state)
+        if youtube_selected and str((youtube_item or {}).get("youtube_status") or "") != "uploaded":
+            return False
+        if instagram_selected and str((instagram_item or {}).get("instagram_status") or "") != "uploaded":
+            return False
+        if telegram_selected:
+            return job.delivery_status == "sent"
+        return True
 
     async def _deliver_completed_jobs(self, application: Application) -> None:
         pending = self.job_service.list_delivery_pending_jobs()
@@ -531,6 +701,25 @@ class TelegramBotRuntime:
                 if state.loop_instagram_enabled:
                     self.instagram_queue.enqueue_job(refreshed, instagram_enabled_for_origin=True)
                 continue
+            if job.origin == "loop":
+                youtube_item, instagram_item = self._ensure_loop_publication_jobs(job, state)
+                telegram_selected, youtube_selected, instagram_selected, _, _ = self._loop_job_targets(job, state)
+                waiting_for: list[str] = []
+                if youtube_selected and str((youtube_item or {}).get("youtube_status") or "") != "uploaded":
+                    waiting_for.append("YouTube")
+                if instagram_selected and str((instagram_item or {}).get("instagram_status") or "") != "uploaded":
+                    waiting_for.append("Instagram")
+                if telegram_selected and waiting_for:
+                    self.db.update_job(
+                        job.id,
+                        status=job.status,
+                        progress=job.progress,
+                        phase=job.phase,
+                        message=job.message,
+                        delivery_status="pending",
+                        delivery_message=f"Waiting for {' and '.join(waiting_for)} before Telegram delivery",
+                    )
+                    continue
             if job.chat_id is None:
                 self.db.update_job(
                     job.id,
@@ -555,13 +744,17 @@ class TelegramBotRuntime:
                 )
                 self.db.append_delivery_log(job.id, job.chat_id, "skipped", "Retry limit reached")
                 continue
+            if not self.db.claim_delivery(job.id):
+                continue
             try:
-                await self.send_single_video(application, job, chat_id=job.chat_id, mark_delivery=True)
-                refreshed = self.job_service.get_job(job.id)
-                if job.origin == "loop" and state.loop_youtube_enabled:
-                    self.youtube_queue.enqueue_loop_job(refreshed)
-                if job.origin == "loop" and state.loop_instagram_enabled:
-                    self.instagram_queue.enqueue_job(refreshed, instagram_enabled_for_origin=True)
+                caption_override = self._build_loop_delivery_caption(job) if job.origin == "loop" else None
+                await self.send_single_video(
+                    application,
+                    job,
+                    chat_id=job.chat_id,
+                    mark_delivery=True,
+                    caption_override=caption_override,
+                )
             except Exception as exc:
                 logger.exception("Failed to deliver job %s", job.id)
                 self.db.update_job(
@@ -575,7 +768,9 @@ class TelegramBotRuntime:
                 )
                 self.db.append_delivery_log(job.id, job.chat_id, "failed", str(exc)[:300])
                 if job.origin == "loop":
-                    await application.bot.send_message(
+                    await self._send_logged_message(
+                        application.bot,
+                        "loop_delivery_failed",
                         chat_id=job.chat_id,
                         text=f"⚠️ Loop delivery failed for Job #{job.id}\n<code>{html.escape(str(exc)[:300])}</code>",
                         parse_mode=ParseMode.HTML,
@@ -626,8 +821,13 @@ class TelegramBotRuntime:
                 )
                 return batch
             except BadRequest as exc:
+                message = str(exc).lower()
+                if "message is not modified" in message:
+                    return batch
                 logger.warning("Batch %s progress message not editable: %s", batch.id, exc)
-        message = await application.bot.send_message(
+        message = await self._send_logged_message(
+            application.bot,
+            "batch_progress_new_message",
             chat_id=batch.chat_id,
             text=text,
             parse_mode=ParseMode.HTML,
@@ -662,11 +862,19 @@ class TelegramBotRuntime:
         percent = int(round(max(0.0, min(1.0, blended_progress)) * 100))
         return f"{ascii_bar(blended_progress)} {percent:>3d}%"
 
-    async def send_single_video(self, application: Application, job: JobDetail, *, chat_id: int, mark_delivery: bool) -> None:
+    async def send_single_video(
+        self,
+        application: Application,
+        job: JobDetail,
+        *,
+        chat_id: int,
+        mark_delivery: bool,
+        caption_override: str | None = None,
+    ) -> None:
         output_path = self.config.root_dir / (job.output_path or "")
         if not output_path.exists():
             raise FileNotFoundError(f"Missing output file for job {job.id}")
-        caption = self._video_caption(job)
+        caption = caption_override or self._video_caption(job)
         if job.telegram_file_id:
             message = await application.bot.send_video(
                 chat_id=chat_id,
@@ -729,7 +937,9 @@ class TelegramBotRuntime:
                     self.db.update_batch(batch_id, completed_count=sent, failed_count=failed, status="active")
             if batch_id is not None:
                 self.db.update_batch(batch_id, completed_count=sent, failed_count=failed, status="completed" if sent else "failed")
-                await application.bot.send_message(
+                await self._send_logged_message(
+                    application.bot,
+                    "send_many_finished",
                     chat_id=chat_id,
                     text=f"📦 Send batch finished.\nSent: <b>{sent}</b>\nFailed: <b>{failed}</b>",
                     parse_mode=ParseMode.HTML,
@@ -756,6 +966,32 @@ class TelegramBotRuntime:
                 f"<b>Job #{job.id}</b>",
             ]
         )
+
+    def _job_title(self, job: JobDetail) -> str:
+        youtube_item = self.youtube_queue.get_item(job.id)
+        if youtube_item and str(youtube_item.get("title") or "").strip():
+            return str(youtube_item.get("title")).strip()
+        return pick_title(job.id, [], job.quote)
+
+    def _build_loop_delivery_caption(self, job: JobDetail) -> str:
+        title = html.escape(self._job_title(job))
+        quote_text = job.quote.strip()
+        if len(quote_text) > 360:
+            quote_text = f"{quote_text[:357].rstrip()}..."
+        lines = [f"🎬 <b>{title}</b>"]
+        if quote_text:
+            lines.extend(["", html.escape(quote_text)])
+            if (job.author or "").strip():
+                lines.append(f"— <i>{html.escape(job.author.strip())}</i>")
+        youtube_item = self.youtube_queue.get_item(job.id)
+        youtube_url = str((youtube_item or {}).get("youtube_shorts_url") or (youtube_item or {}).get("youtube_url") or "").strip()
+        instagram_item = self.instagram_queue.get_item(job.id)
+        instagram_url = str((instagram_item or {}).get("instagram_url") or "").strip()
+        if youtube_url:
+            lines.extend(["", "📺 <b>YouTube URL:</b>", html.escape(youtube_url)])
+        if instagram_url:
+            lines.extend(["", "📸 <b>Instagram URL:</b>", html.escape(instagram_url)])
+        return "\n".join(lines[:])
 
 
 def main_keyboard() -> ReplyKeyboardMarkup:
@@ -957,10 +1193,45 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         if job.status != "completed" or not job.output_path:
             await query.answer("This video is not ready for Instagram upload yet.", show_alert=True)
             return
-        item = runtime.instagram_queue.get_item(job_id)
-        if item is None or str(item.get("instagram_status")) == "failed":
-            item = runtime.instagram_queue.enqueue_job(runtime.job_service.get_job(job_id), instagram_enabled_for_origin=False)
+        stale_after_seconds = runtime._instagram_stale_after_seconds()
+        runtime.instagram_queue.recover_stalled_uploading(stale_after_seconds)
+        previous = runtime.instagram_queue.get_item(job_id)
+        previous_status = str((previous or {}).get("instagram_status") or "")
+        previous_attempts = int((previous or {}).get("attempt_count") or 0)
+
+        if (
+            previous_status == "uploading"
+            and runtime._instagram_upload_task is not None
+            and not runtime._instagram_upload_task.done()
+            and runtime._instagram_upload_started_at is not None
+        ):
+            age_seconds = (datetime.now(timezone.utc) - runtime._instagram_upload_started_at).total_seconds()
+            if age_seconds <= stale_after_seconds:
+                logger.info(
+                    "igup callback ignored because upload is already active: job_id=%s status=%s attempts=%s age_seconds=%s",
+                    job_id,
+                    previous_status,
+                    previous_attempts,
+                    int(age_seconds),
+                )
+                await query.answer("Instagram upload is already in progress.")
+                return
+            logger.warning("igup callback found stale active upload task, canceling: job_id=%s", job_id)
+            runtime._instagram_upload_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await runtime._instagram_upload_task
+
+        item = runtime.instagram_queue.prepare_manual_retry(runtime.job_service.get_job(job_id))
+        logger.info(
+            "igup callback queued retry: job_id=%s previous_status=%s previous_attempts=%s new_status=%s new_attempts=%s",
+            job_id,
+            previous_status or "missing",
+            previous_attempts,
+            str(item.get("instagram_status")),
+            int(item.get("attempt_count") or 0),
+        )
         await runtime._maybe_process_instagram_queue(context.application)
+        item = runtime.instagram_queue.get_item(job_id) or item
         status = str(item.get("instagram_status", "pending"))
         if status == "uploaded":
             await query.answer()
@@ -980,7 +1251,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 reply_to_message_id=job.telegram_message_id,
             )
             return
-        if status == "auth_blocked":
+        if status == "blocked":
             await query.answer()
             await query.message.reply_text(
                 runtime._instagram_queue_text(item),
@@ -990,9 +1261,27 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             )
             return
         if status == "uploading":
-            await query.answer("Instagram upload is already in progress.")
+            await query.answer()
+            await query.message.reply_text(
+                (
+                    "📸 <b>Instagram upload started</b>\n"
+                    "The reel is now being published. This can take a few minutes on the VPS."
+                ),
+                parse_mode=ParseMode.HTML,
+                reply_markup=main_keyboard(),
+                reply_to_message_id=job.telegram_message_id,
+            )
             return
-        await query.answer("Instagram upload queued.")
+        await query.answer()
+        await query.message.reply_text(
+            (
+                "📸 <b>Instagram upload queued</b>\n"
+                "The VPS picked up your reel. I will send the final Instagram message when publishing finishes."
+            ),
+            parse_mode=ParseMode.HTML,
+            reply_markup=main_keyboard(),
+            reply_to_message_id=job.telegram_message_id,
+        )
         return
     if data.startswith("ytup:"):
         job_id = int(data.split(":", 1)[1])
@@ -1210,13 +1499,59 @@ def build_application(config: AppConfig | None = None) -> Application:
     return application
 
 
+def _release_instance_lock() -> None:
+    global _INSTANCE_LOCK_HANDLE
+    if _INSTANCE_LOCK_HANDLE is None:
+        return
+    try:
+        fcntl.flock(_INSTANCE_LOCK_HANDLE.fileno(), fcntl.LOCK_UN)
+    except Exception:
+        pass
+    try:
+        _INSTANCE_LOCK_HANDLE.close()
+    except Exception:
+        pass
+    _INSTANCE_LOCK_HANDLE = None
+
+
+def _acquire_instance_lock(config: AppConfig) -> None:
+    global _INSTANCE_LOCK_HANDLE
+    lock_path = config.state_dir / "telegram-bot.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    handle = lock_path.open("a+", encoding="utf-8")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as exc:
+        handle.seek(0)
+        existing_pid = handle.read().strip()
+        handle.close()
+        if exc.errno in {errno.EACCES, errno.EAGAIN}:
+            raise RuntimeError(
+                f"Another telegram bot instance is already running"
+                f"{f' (pid {existing_pid})' if existing_pid else ''}."
+            ) from exc
+        raise
+    handle.seek(0)
+    handle.truncate()
+    handle.write(str(os.getpid()))
+    handle.flush()
+    _INSTANCE_LOCK_HANDLE = handle
+    atexit.register(_release_instance_lock)
+
+
 def main() -> None:
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
-    app = build_application()
-    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=False)
+    config = load_config()
+    try:
+        _acquire_instance_lock(config)
+    except RuntimeError as exc:
+        logger.error("%s", exc)
+        return
+    app = build_application(config)
+    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 
 if __name__ == "__main__":
