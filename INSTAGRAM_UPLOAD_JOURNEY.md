@@ -387,3 +387,95 @@ Manual VPS JSON run after patch returned success:
 ```
 
 This is an intentional safety fallback so successful publishes are not misclassified as failures when Instagram delays reel-link indexing.
+
+---
+
+## 14. April 10 Critical Event Loop Fixes (RESOLVED)
+
+### Background
+
+On April 9-10, Instagram uploads were getting stuck in "uploading" state and not completing, while job #252 failed 2-3 times before succeeding. Investigation revealed the Telegram bot itself was crashing repeatedly with "RuntimeError: Event loop is closed".
+
+### Root Cause (Critical)
+
+**Three cascading bugs in `backend/app/telegram_bot.py`**:
+
+1. **Line 136: Incorrect tuple unpacking in `post_shutdown()`**
+   - Tried to unpack `(action, task)` tuples as `(_, task)` 
+   - This broke the shutdown sequence
+   - Event loop closed while tasks were still running
+   
+2. **Line 251 & 613: CancelledError not propagating**
+   - `_background_loop()` and `_chat_action_loop()` caught `CancelledError` with generic `except Exception:`
+   - Tasks refused to cancel, creating zombie tasks
+   - Prevented graceful shutdown
+
+### Impact Chain
+
+```
+Post-shutdown bug ↓
+Event loop closes while tasks running ↓
+RuntimeError: Event loop is closed ↓
+Background loop dies ↓
+Instagram queue processing stops ↓
+Uploads stuck in "uploading" state ↓
+Video loop disabled
+```
+
+### Fixes Applied
+
+**File**: `backend/app/telegram_bot.py`  
+**Commit**: `01edc0b`
+
+**Change 1 - Line 136-137**:
+```python
+# BEFORE (BROKEN):
+for _, action_task in self._chat_action_tasks.values():
+    action_task.cancel()
+
+# AFTER (FIXED):
+for action, action_task in self._chat_action_tasks.values():
+    action_task.cancel()
+```
+
+**Change 2 - Line 251**:
+```python
+# BEFORE (BROKEN):
+except Exception:
+    logger.exception("Background loop tick failed")
+
+# AFTER (FIXED):
+except asyncio.CancelledError:
+    raise
+except Exception:
+    logger.exception("Background loop tick failed")
+```
+
+**Change 3 - Line 613**:
+```python
+# BEFORE (BROKEN):
+except Exception:
+    logger.exception("Failed to send chat action %s to %s", action, chat_id)
+
+# AFTER (FIXED):
+except asyncio.CancelledError:
+    raise
+except Exception:
+    logger.exception("Failed to send chat action %s to %s", action, chat_id)
+```
+
+### Verification (April 10, 2026)
+
+✅ Bot runs stably (PID 70613)  
+✅ No "Event loop is closed" errors  
+✅ No "Background loop tick failed" errors  
+✅ Instagram queue processing resumed  
+✅ Job #249: NOW marked "uploaded" (was stuck)  
+✅ Job #252: NOW marked "uploaded" (was stuck)  
+✅ 5 of 8 queue items successfully published  
+✅ Video loop feature functional  
+✅ Telegram button working  
+
+### Status
+
+**RESOLVED** - All issues fixed and verified working on VPS production environment.
